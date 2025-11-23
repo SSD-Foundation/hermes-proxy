@@ -44,7 +44,7 @@ func (s *NodeServer) Start(ctx context.Context) error {
 	}
 
 	s.grpcServer = grpc.NewServer()
-	approuterpb.RegisterAppRouterServer(s.grpcServer, NewAppRouterService(s.log, s.registry))
+	approuterpb.RegisterAppRouterServer(s.grpcServer, NewAppRouterService(s.log, s.registry, s.keystore))
 
 	go func() {
 		<-ctx.Done()
