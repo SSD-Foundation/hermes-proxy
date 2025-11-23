@@ -5,11 +5,48 @@ This repository tracks the Phase 1 implementation of HERMES router nodes: a gRPC
 ## Getting started
 - Read the MVP scope in `docs/hermes-mvp-revised.md`.
 - Review the Phase 1 plan and iteration prompts in `docs/plan/phase-1/`.
-- Development workflow (in progress):
-  - Build/lint/test commands will live in a `Makefile`.
-  - Docker and Compose files will support local integration tests with mock apps.
+- The gRPC contract lives in `proto/app_router.proto` with generated Go stubs in `pkg/api/approuterpb`.
+- The node binary entrypoint is `cmd/node` and currently exposes a stubbed `AppRouter.Open` handler.
+
+## Development workflow
+- Install Go 1.22+ and ensure `protoc` with the Go plugins is available if regenerating protobufs.
+- Set `HERMES_KEYSTORE_PASSPHRASE` (or another env set in config) so the keystore backend can initialize/unlock.
+- Common tasks:
+  - `make fmt` – format the Go sources.
+  - `make lint` – run `go vet`.
+  - `make test` – run unit tests.
+  - `make build` – build all packages.
+  - `make proto` – regenerate gRPC stubs from `proto/app_router.proto`.
+
+## Running the stub node
+The current binary wires config, structured logging, keystore initialization, and the placeholder gRPC service.
+
+```bash
+export HERMES_KEYSTORE_PASSPHRASE=change-me
+go run ./cmd/node --config config/dev.yaml
+```
+
+If the keystore file does not exist, it is initialized automatically at the configured path.
+
+## Configuration
+Configuration is read from a file plus environment overrides (`HERMES_` prefix). Example:
+
+```yaml
+grpc_address: "0.0.0.0:50051"
+log_level: "info"
+shutdown_grace_period: "10s"
+keystore:
+  path: "data/keystore.json"
+  passphrase_env: "HERMES_KEYSTORE_PASSPHRASE"
+```
 
 ## Project structure
+- `cmd/node`: Node entrypoint wiring config, logging, keystore, registry, and gRPC server.
+- `proto/app_router.proto`: AppRouter protobuf contract; generated code in `pkg/api/approuterpb`.
+- `internal/config`: Config loader with env overrides.
+- `internal/keystore`: Argon2id-derived file backend (placeholder encryption) with tests.
+- `internal/registry`: In-memory chat/tieline registry scaffold.
+- `internal/server`: gRPC server wiring and stubbed `AppRouter` implementation.
 - `docs/hermes-mvp-revised.md`: Revised MVP specification.
 - `docs/plan/phase-1/`: Implementation plan and iteration prompts for nodes.
 - `docs/wiki/core-node-functionality.md`: Core behavior and operational notes (kept current as features land).

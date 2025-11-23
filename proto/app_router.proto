@@ -1,0 +1,95 @@
+syntax = "proto3";
+
+package approuter.v1;
+
+option go_package = "github.com/hermes-proxy/hermes-proxy/pkg/api/approuterpb;approuterpb";
+
+// AppRouter defines the bidirectional stream used by apps to interact with the node.
+service AppRouter {
+  rpc Open(stream AppFrame) returns (stream AppFrame);
+}
+
+// AppFrame is the envelope exchanged over the Open stream.
+message AppFrame {
+  // correlation_id lets clients tie responses to requests when needed.
+  string correlation_id = 1;
+
+  oneof body {
+    Connect connect = 2;
+    ConnectAck connect_ack = 3;
+
+    StartChat start_chat = 4;
+    StartChatAck start_chat_ack = 5;
+
+    ChatMessage chat_message = 6;
+    ChatMessageAck chat_message_ack = 7;
+
+    DeleteChat delete_chat = 8;
+    DeleteChatAck delete_chat_ack = 9;
+
+    Error error = 10;
+    Heartbeat heartbeat = 11;
+  }
+}
+
+// Connect is the initial handshake frame from an app.
+message Connect {
+  bytes app_public_key = 1;
+  bytes signature = 2;
+  string node_id = 3;
+  map<string, string> metadata = 4;
+}
+
+// ConnectAck confirms a successful connection/authentication.
+message ConnectAck {
+  string assigned_session_id = 1;
+}
+
+// StartChat initiates a chat with a peer connected to the same node.
+message StartChat {
+  string chat_id = 1;
+  bytes peer_public_ephemeral_key = 2;
+  bytes signature = 3;
+  map<string, string> metadata = 4;
+}
+
+// StartChatAck acknowledges chat initialization.
+message StartChatAck {
+  string chat_id = 1;
+}
+
+// ChatMessage carries encrypted payloads between peers.
+message ChatMessage {
+  string chat_id = 1;
+  bytes payload = 2;
+  uint64 sequence = 3;
+}
+
+// ChatMessageAck acknowledges receipt of a chat payload.
+message ChatMessageAck {
+  string chat_id = 1;
+  uint64 sequence = 2;
+}
+
+// DeleteChat requests teardown of chat state and key erasure.
+message DeleteChat {
+  string chat_id = 1;
+  string reason = 2;
+}
+
+// DeleteChatAck confirms chat teardown.
+message DeleteChatAck {
+  string chat_id = 1;
+  string status = 2;
+}
+
+// Heartbeat keeps the stream active and allows liveness tracking.
+message Heartbeat {
+  int64 timestamp_nanos = 1;
+}
+
+// Error communicates terminal stream issues.
+message Error {
+  string code = 1;
+  string message = 2;
+}

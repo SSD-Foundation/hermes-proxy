@@ -3,6 +3,8 @@
 ## Overview
 Phase 1 targets a single-node deployment of the HERMES router. The node exposes a gRPC `AppRouter` service that accepts bidirectional streams from Apps, authenticates them with identity keys, and routes encrypted chat frames between two Apps connected to the same node. No NodeMesh, blockchain, or NAT helpers are present in this phase.
 
+Iteration 01 scaffolding is in place: Go module with structured logging/config loader, Argon2id-derived file keystore skeleton (placeholder encryption), in-memory chat registry, and a stubbed `AppRouter.Open` handler wired through the node binary.
+
 ## Key behaviors
 - **Connection handling**: Node accepts App connections over TLS gRPC, performs identity key verification, and maintains session metadata with keep-alives/heartbeats.
 - **Chat lifecycle**: StartChat validates signed ephemeral keys, allocates an in-memory tieline keyed by `chat_id`, and relays encrypted payload envelopes. DeleteChat tears down the tieline and triggers key erasure hooks.
