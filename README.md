@@ -1,10 +1,10 @@
-# HERMES Nodes (Phase 1)
+# HERMES Nodes (Phase 1 delivered; Phase 2 planning)
 
-This repository tracks the Phase 1 implementation of HERMES router nodes: a gRPC-based service that connects Apps, manages encrypted 1:1 chats on a single node, and prepares the groundwork for later mesh, payments, and NAT features. Platform target is Ubuntu Linux.
+This repository tracks the HERMES router nodes. Phase 1 delivers a gRPC-based service that connects Apps, manages encrypted 1:1 chats on a single node, and prepares the groundwork for the mesh, payments, and NAT features that follow. Platform target is Ubuntu Linux. Phase 2 planning (multi-node mesh and discovery) lives under `docs/plan/phase-2/`.
 
 ## Getting started
 - Read the MVP scope in `docs/hermes-mvp-revised.md`.
-- Review the Phase 1 plan and iteration prompts in `docs/plan/phase-1/`.
+- Review the Phase 1 plan and iteration prompts in `docs/plan/phase-1/` and the Phase 2 plan in `docs/plan/phase-2/`.
 - The gRPC contract lives in `proto/app_router.proto` with generated Go stubs in `pkg/api/approuterpb`.
 - The node binary entrypoint is `cmd/node` and hosts the `AppRouter.Open` bidirectional stream for connect/start chat/send/delete flows.
 
@@ -69,7 +69,8 @@ grpc_server:
 - `internal/registry`: In-memory chat/tieline registry.
 - `internal/server`: gRPC server wiring and `AppRouter` implementation (connect handshake, chat routing, teardown, metrics, housekeeping).
 - `docs/hermes-mvp-revised.md`: Revised MVP specification.
-- `docs/plan/phase-1/`: Implementation plan and iteration prompts for nodes.
+- `docs/plan/phase-1/`: Implementation plan and iteration prompts for the delivered single-node scope.
+- `docs/plan/phase-2/`: Implementation plan and iteration prompts for the mesh/discovery scope.
 - `docs/wiki/core-node-functionality.md`: Core behavior and operational notes (kept current as features land).
 - `AGENT.md`: Mandatory guardrails for testing, deployment, and docs maintenance.
 - `release-notes.md`: Latest user-visible changes.
