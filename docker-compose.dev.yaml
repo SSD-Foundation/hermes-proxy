@@ -1,0 +1,61 @@
+version: "3.9"
+
+services:
+  node:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hermes-node:dev
+    environment:
+      - HERMES_KEYSTORE_PASSPHRASE=compose-passphrase
+    command: ["/usr/local/bin/node", "--config", "/app/config/container.yaml"]
+    volumes:
+      - node-data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  app1:
+    image: hermes-node:dev
+    depends_on:
+      node:
+        condition: service_healthy
+    entrypoint: ["/usr/local/bin/mockapp"]
+    command:
+      [
+        "--node",
+        "node:50051",
+        "--node-id",
+        "hermes-dev",
+        "--chat-id",
+        "integration-chat",
+        "--role",
+        "sender",
+        "--payload",
+        "integration-payload-0123456789",
+      ]
+
+  app2:
+    image: hermes-node:dev
+    depends_on:
+      node:
+        condition: service_healthy
+    entrypoint: ["/usr/local/bin/mockapp"]
+    command:
+      [
+        "--node",
+        "node:50051",
+        "--node-id",
+        "hermes-dev",
+        "--chat-id",
+        "integration-chat",
+        "--role",
+        "receiver",
+        "--payload",
+        "integration-payload-0123456789",
+      ]
+
+volumes:
+  node-data:

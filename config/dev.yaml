@@ -1,0 +1,19 @@
+grpc_address: "0.0.0.0:50051"
+log_level: "info"
+shutdown_grace_period: "10s"
+keystore:
+  path: "data/keystore.json"
+  passphrase_env: "HERMES_KEYSTORE_PASSPHRASE"
+admin:
+  address: "0.0.0.0:8080"
+  read_header_timeout: "5s"
+cleanup:
+  sweep_interval: "30s"
+  session_idle_timeout: "5m"
+  chat_idle_timeout: "10m"
+grpc_server:
+  max_recv_msg_size: 4194304
+  max_send_msg_size: 4194304
+  keepalive_time: "2m"
+  keepalive_timeout: "20s"
+  max_connection_idle: "0s"
