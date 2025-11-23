@@ -26,30 +26,79 @@ const (
 	minCiphertextBytes = 16
 )
 
+// RouterOptions configures observability and lifecycle hooks.
+type RouterOptions struct {
+	Metrics              *routerMetrics
+	SessionIdleTimeout   time.Duration
+	ChatIdleTimeout      time.Duration
+	HousekeepingInterval time.Duration
+}
+
 // AppRouterService implements the gRPC AppRouter contract.
 type AppRouterService struct {
 	approuterpb.UnimplementedAppRouterServer
-	log      *zap.Logger
-	registry registry.ChatRegistry
-	keystore keystore.KeyBackend
+	log       *zap.Logger
+	registry  registry.ChatRegistry
+	keystore  keystore.KeyBackend
+	metrics   *routerMetrics
+	mu        sync.Mutex
+	sessions  map[string]*appSession
+	chats     map[string]*tieline
+	houseOnce sync.Once
 
-	mu       sync.Mutex
-	sessions map[string]*appSession
-	chats    map[string]*tieline
+	sessionIdleTimeout   time.Duration
+	chatIdleTimeout      time.Duration
+	housekeepingInterval time.Duration
 }
 
 // NewAppRouterService wires dependencies for the gRPC handler.
-func NewAppRouterService(log *zap.Logger, reg registry.ChatRegistry, ks keystore.KeyBackend) *AppRouterService {
+func NewAppRouterService(log *zap.Logger, reg registry.ChatRegistry, ks keystore.KeyBackend, opts RouterOptions) *AppRouterService {
 	if reg == nil {
 		reg = registry.NewInMemory(0)
 	}
-	return &AppRouterService{
-		log:      log,
-		registry: reg,
-		keystore: ks,
-		sessions: make(map[string]*appSession),
-		chats:    make(map[string]*tieline),
+	svc := &AppRouterService{
+		log:                  log,
+		registry:             reg,
+		keystore:             ks,
+		metrics:              opts.Metrics,
+		sessions:             make(map[string]*appSession),
+		chats:                make(map[string]*tieline),
+		sessionIdleTimeout:   opts.SessionIdleTimeout,
+		chatIdleTimeout:      opts.ChatIdleTimeout,
+		housekeepingInterval: opts.HousekeepingInterval,
 	}
+	if svc.sessionIdleTimeout <= 0 {
+		svc.sessionIdleTimeout = 5 * time.Minute
+	}
+	if svc.chatIdleTimeout <= 0 {
+		svc.chatIdleTimeout = 15 * time.Minute
+	}
+	if svc.housekeepingInterval <= 0 {
+		svc.housekeepingInterval = time.Minute
+	}
+	return svc
+}
+
+// StartHousekeeping launches periodic cleanup for idle chats.
+func (s *AppRouterService) StartHousekeeping(ctx context.Context) {
+	if s.chatIdleTimeout <= 0 || s.housekeepingInterval <= 0 {
+		return
+	}
+
+	s.houseOnce.Do(func() {
+		ticker := time.NewTicker(s.housekeepingInterval)
+		go func() {
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					s.expireIdleChats(time.Now())
+				}
+			}
+		}()
+	})
 }
 
 // Open handles the bidirectional AppRouter stream.
@@ -69,10 +118,13 @@ func (s *AppRouterService) Open(stream approuterpb.AppRouter_OpenServer) error {
 		return status.Error(codes.InvalidArgument, "first frame must be Connect")
 	}
 
+	start := time.Now()
 	session, err := s.handleConnect(ctx, connect)
 	if err != nil {
+		s.observe("connect", start, err)
 		return err
 	}
+	s.observe("connect", start, nil)
 	defer s.cleanupSession(session)
 
 	go s.sender(stream, session)
@@ -86,6 +138,7 @@ func (s *AppRouterService) Open(stream approuterpb.AppRouter_OpenServer) error {
 	}
 
 	for {
+		start := time.Now()
 		frame, recvErr := stream.Recv()
 		if recvErr != nil {
 			if errors.Is(recvErr, io.EOF) || errors.Is(recvErr, context.Canceled) {
@@ -95,7 +148,9 @@ func (s *AppRouterService) Open(stream approuterpb.AppRouter_OpenServer) error {
 			return recvErr
 		}
 
+		op := metricOp(frame)
 		if err := s.routeFrame(session, frame); err != nil {
+			s.observe(op, start, err)
 			var rerr *routeError
 			if errors.As(err, &rerr) {
 				_ = s.pushFrame(session, &approuterpb.AppFrame{
@@ -110,6 +165,7 @@ func (s *AppRouterService) Open(stream approuterpb.AppRouter_OpenServer) error {
 			}
 			return err
 		}
+		s.observe(op, start, nil)
 	}
 }
 
@@ -131,6 +187,7 @@ func (s *AppRouterService) handleConnect(parentCtx context.Context, connect *app
 	}
 
 	ctx, cancel := context.WithCancel(parentCtx)
+	now := time.Now()
 	session := &appSession{
 		id:           sessionID,
 		appPublicKey: append([]byte(nil), connect.AppPublicKey...),
@@ -138,18 +195,21 @@ func (s *AppRouterService) handleConnect(parentCtx context.Context, connect *app
 		sendCh:       make(chan *approuterpb.AppFrame, sendBufferSize),
 		ctx:          ctx,
 		cancel:       cancel,
-		connectedAt:  time.Now(),
+		connectedAt:  now,
+		lastSeen:     now,
 	}
 
 	s.mu.Lock()
 	s.sessions[sessionID] = session
 	s.mu.Unlock()
+	s.incSession()
 
 	s.log.Info("app connected", zap.String("session_id", sessionID), zap.Any("metadata", connect.Metadata))
 	return session, nil
 }
 
 func (s *AppRouterService) routeFrame(session *appSession, frame *approuterpb.AppFrame) error {
+	s.touchSession(session)
 	switch body := frame.Body.(type) {
 	case *approuterpb.AppFrame_StartChat:
 		return s.handleStartChat(session, body.StartChat)
@@ -195,12 +255,14 @@ func (s *AppRouterService) handleStartChat(session *appSession, start *approuter
 			CreatedAt: time.Now(),
 			Metadata:  start.Metadata,
 		})
+		s.incChat()
 	}
 
 	if err := tl.addParticipant(participant); err != nil {
 		s.mu.Unlock()
 		return &routeError{code: "INVALID_FRAME", msg: err.Error()}
 	}
+	tl.markActive()
 
 	if tl.ready() {
 		for sid, p := range tl.participants {
@@ -287,6 +349,7 @@ func (s *AppRouterService) handleChatMessage(session *appSession, msg *approuter
 	}
 
 	sender.nextSeq = msg.Sequence
+	tl.markActive()
 	s.mu.Unlock()
 
 	if err := s.pushFrame(session, &approuterpb.AppFrame{
@@ -318,13 +381,17 @@ func (s *AppRouterService) handleDeleteChat(session *appSession, del *approuterp
 	}
 
 	var sessions []*appSession
+	var removed bool
 
 	s.mu.Lock()
 	if tl, ok := s.chats[del.ChatId]; ok {
+		tl.markActive()
 		for _, p := range tl.participants {
 			sessions = append(sessions, p.session)
 		}
 		delete(s.chats, del.ChatId)
+		tl.wipeSecrets()
+		removed = true
 	}
 	s.mu.Unlock()
 
@@ -332,8 +399,11 @@ func (s *AppRouterService) handleDeleteChat(session *appSession, del *approuterp
 		return &routeError{code: "CHAT_NOT_FOUND", msg: "chat not found"}
 	}
 
-	_ = s.registry.Delete(del.ChatId)
-	s.eraseSecret(del.ChatId)
+	if removed {
+		s.decChat()
+		_ = s.registry.Delete(del.ChatId)
+		s.eraseSecret(del.ChatId)
+	}
 
 	for _, target := range sessions {
 		statusMsg := "deleted"
@@ -397,20 +467,29 @@ func (s *AppRouterService) pushFrame(session *appSession, frame *approuterpb.App
 func (s *AppRouterService) cleanupSession(session *appSession) {
 	session.cancel()
 
+	var deletedChats []string
+
 	s.mu.Lock()
 	delete(s.sessions, session.id)
 	for chatID, tl := range s.chats {
 		if _, ok := tl.participants[session.id]; ok {
 			tl.removeParticipant(session.id)
 			if tl.isEmpty() {
+				tl.wipeSecrets()
 				delete(s.chats, chatID)
-				_ = s.registry.Delete(chatID)
-				s.eraseSecret(chatID)
+				deletedChats = append(deletedChats, chatID)
 			}
 		}
 	}
 	close(session.sendCh)
 	s.mu.Unlock()
+
+	s.decSession()
+	for _, chatID := range deletedChats {
+		_ = s.registry.Delete(chatID)
+		s.eraseSecret(chatID)
+		s.decChat()
+	}
 
 	s.log.Info("app disconnected", zap.String("session_id", session.id))
 }
@@ -420,6 +499,7 @@ func (s *AppRouterService) persistChatSecret(chatID string, keys [][]byte) {
 		return
 	}
 	combined := bytes.Join(keys, []byte(":"))
+	defer zeroBytes(combined)
 	if err := s.keystore.StoreSecret(context.Background(), chatID, combined); err != nil {
 		s.log.Warn("persist chat secret", zap.Error(err), zap.String("chat_id", chatID))
 	}
@@ -431,6 +511,131 @@ func (s *AppRouterService) eraseSecret(chatID string) {
 	}
 	if err := s.keystore.DeleteSecret(context.Background(), chatID); err != nil {
 		s.log.Warn("erase chat secret", zap.Error(err), zap.String("chat_id", chatID))
+	}
+}
+
+func (s *AppRouterService) expireIdleChats(now time.Time) {
+	if s.chatIdleTimeout <= 0 {
+		return
+	}
+
+	type expiring struct {
+		id       string
+		sessions []*appSession
+	}
+
+	var expired []expiring
+
+	s.mu.Lock()
+	for chatID, tl := range s.chats {
+		if now.Sub(tl.lastActivity) > s.chatIdleTimeout {
+			tl.wipeSecrets()
+			sessions := make([]*appSession, 0, len(tl.participants))
+			for _, p := range tl.participants {
+				sessions = append(sessions, p.session)
+			}
+			delete(s.chats, chatID)
+			expired = append(expired, expiring{id: chatID, sessions: sessions})
+		}
+	}
+	s.mu.Unlock()
+
+	for _, chat := range expired {
+		s.decChat()
+		_ = s.registry.Delete(chat.id)
+		s.eraseSecret(chat.id)
+		s.recordChatExpiry()
+		for _, sess := range chat.sessions {
+			_ = s.pushFrame(sess, &approuterpb.AppFrame{
+				Body: &approuterpb.AppFrame_DeleteChatAck{
+					DeleteChatAck: &approuterpb.DeleteChatAck{
+						ChatId: chat.id,
+						Status: "expired",
+					},
+				},
+			})
+		}
+		s.log.Info("expired idle chat", zap.String("chat_id", chat.id))
+	}
+}
+
+func (s *AppRouterService) observe(op string, start time.Time, err error) {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.observeLatency(op, time.Since(start))
+	if err != nil {
+		code := "internal"
+		var rerr *routeError
+		if errors.As(err, &rerr) && rerr.code != "" {
+			code = rerr.code
+		}
+		s.metrics.recordError(code)
+	}
+}
+
+func (s *AppRouterService) touchSession(session *appSession) {
+	s.mu.Lock()
+	session.lastSeen = time.Now()
+	s.mu.Unlock()
+}
+
+func (s *AppRouterService) incSession() {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.incSession()
+}
+
+func (s *AppRouterService) decSession() {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.decSession()
+}
+
+func (s *AppRouterService) incChat() {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.incChat()
+}
+
+func (s *AppRouterService) decChat() {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.decChat()
+}
+
+func (s *AppRouterService) recordChatExpiry() {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.recordChatExpiry()
+}
+
+func metricOp(frame *approuterpb.AppFrame) string {
+	if frame == nil {
+		return "unknown"
+	}
+	switch frame.Body.(type) {
+	case *approuterpb.AppFrame_StartChat:
+		return "start_chat"
+	case *approuterpb.AppFrame_ChatMessage:
+		return "chat_message"
+	case *approuterpb.AppFrame_DeleteChat:
+		return "delete_chat"
+	case *approuterpb.AppFrame_Heartbeat:
+		return "heartbeat"
+	default:
+		return "unknown"
+	}
+}
+
+func zeroBytes(data []byte) {
+	for i := range data {
+		data[i] = 0
 	}
 }
 
@@ -471,6 +676,7 @@ type appSession struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
 	connectedAt  time.Time
+	lastSeen     time.Time
 }
 
 // chatParticipant wraps per-chat sender state.
@@ -501,12 +707,14 @@ func (e *routeError) Error() string {
 type tieline struct {
 	id           string
 	participants map[string]*chatParticipant
+	lastActivity time.Time
 }
 
 func newTieline(id string) *tieline {
 	return &tieline{
 		id:           id,
 		participants: make(map[string]*chatParticipant),
+		lastActivity: time.Now(),
 	}
 }
 
@@ -522,7 +730,10 @@ func (t *tieline) addParticipant(p *chatParticipant) error {
 }
 
 func (t *tieline) removeParticipant(sessionID string) {
-	delete(t.participants, sessionID)
+	if p, ok := t.participants[sessionID]; ok {
+		zeroBytes(p.ephemeralKey)
+		delete(t.participants, sessionID)
+	}
 }
 
 func (t *tieline) peer(sessionID string) *chatParticipant {
@@ -540,4 +751,14 @@ func (t *tieline) ready() bool {
 
 func (t *tieline) isEmpty() bool {
 	return len(t.participants) == 0
+}
+
+func (t *tieline) markActive() {
+	t.lastActivity = time.Now()
+}
+
+func (t *tieline) wipeSecrets() {
+	for _, p := range t.participants {
+		zeroBytes(p.ephemeralKey)
+	}
 }

@@ -2,7 +2,7 @@ GO ?= go
 PROTOC ?= protoc
 PROTO_SRC := proto/app_router.proto
 
-.PHONY: all proto fmt lint test build check
+.PHONY: all proto fmt lint test build check integration
 
 all: build
 
@@ -22,3 +22,9 @@ build:
 	$(GO) build ./...
 
 check: fmt lint test
+
+integration:
+	@set -e; \
+	trap 'docker compose -f docker-compose.dev.yaml down --remove-orphans' EXIT; \
+	docker compose -f docker-compose.dev.yaml up -d --build; \
+	docker compose -f docker-compose.dev.yaml wait app1 app2

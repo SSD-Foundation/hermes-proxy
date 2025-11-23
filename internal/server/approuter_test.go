@@ -164,6 +164,71 @@ func TestStartChatSignatureFailure(t *testing.T) {
 	}
 }
 
+func TestIdleChatExpiry(t *testing.T) {
+	reg := registry.NewInMemory(0)
+	ks := newMemoryKeystore()
+	svc := NewAppRouterService(zaptest.NewLogger(t), reg, ks, RouterOptions{
+		ChatIdleTimeout:      10 * time.Millisecond,
+		HousekeepingInterval: 5 * time.Millisecond,
+	})
+
+	session1 := &appSession{
+		id:       "s1",
+		sendCh:   make(chan *approuterpb.AppFrame, 2),
+		ctx:      context.Background(),
+		cancel:   func() {},
+		lastSeen: time.Now(),
+	}
+	session2 := &appSession{
+		id:       "s2",
+		sendCh:   make(chan *approuterpb.AppFrame, 2),
+		ctx:      context.Background(),
+		cancel:   func() {},
+		lastSeen: time.Now(),
+	}
+
+	tl := newTieline("chat-expire")
+	tl.participants[session1.id] = &chatParticipant{session: session1}
+	tl.participants[session2.id] = &chatParticipant{session: session2}
+	tl.lastActivity = time.Now().Add(-time.Minute)
+
+	_ = reg.Register(registry.ChatSession{ChatID: "chat-expire"})
+	if err := ks.StoreSecret(context.Background(), "chat-expire", []byte("secret")); err != nil {
+		t.Fatalf("seed keystore: %v", err)
+	}
+
+	svc.mu.Lock()
+	svc.chats["chat-expire"] = tl
+	svc.mu.Unlock()
+
+	svc.expireIdleChats(time.Now())
+
+	if _, ok := reg.Get("chat-expire"); ok {
+		t.Fatalf("expected registry entry removed after expiry")
+	}
+	if ks.has("chat-expire") {
+		t.Fatalf("expected keystore secret removed after expiry")
+	}
+
+	expectExpired := func(ch <-chan *approuterpb.AppFrame) {
+		select {
+		case frame := <-ch:
+			ack, ok := frame.Body.(*approuterpb.AppFrame_DeleteChatAck)
+			if !ok {
+				t.Fatalf("expected DeleteChatAck, got %T", frame.Body)
+			}
+			if ack.DeleteChatAck.Status != "expired" {
+				t.Fatalf("expected status expired, got %s", ack.DeleteChatAck.Status)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for expiry ack")
+		}
+	}
+
+	expectExpired(session1.sendCh)
+	expectExpired(session2.sendCh)
+}
+
 func startTestRouter(t *testing.T) (addr string, stop func(), reg registry.ChatRegistry, ks *memoryKeystore) {
 	t.Helper()
 
@@ -175,7 +240,7 @@ func startTestRouter(t *testing.T) (addr string, stop func(), reg registry.ChatR
 	reg = registry.NewInMemory(0)
 	ks = newMemoryKeystore()
 	srv := grpc.NewServer()
-	approuterpb.RegisterAppRouterServer(srv, NewAppRouterService(zaptest.NewLogger(t), reg, ks))
+	approuterpb.RegisterAppRouterServer(srv, NewAppRouterService(zaptest.NewLogger(t), reg, ks, RouterOptions{}))
 
 	go func() {
 		if serveErr := srv.Serve(listener); serveErr != nil {

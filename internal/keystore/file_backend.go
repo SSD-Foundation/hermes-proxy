@@ -12,7 +12,7 @@ import (
 	"sync"
 
 	"golang.org/x/crypto/argon2"
-	"golang.org/x/crypto/blake2b"
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
 // KeyBackend exposes the keystore contract used by the server.
@@ -34,12 +34,12 @@ type FileBackend struct {
 }
 
 const (
-	currentVersion  = 1
-	argonTime       = 1
-	argonMemory     = 64 * 1024
-	argonThreads    = 4
-	argonKeyLength  = 32
-	defaultNonceLen = 12
+	currentVersion = 1
+	argonTime      = 1
+	argonMemory    = 64 * 1024
+	argonThreads   = 4
+	argonKeyLength = 32
+	nonceSize      = chacha20poly1305.NonceSizeX
 )
 
 var (
@@ -92,7 +92,9 @@ func (b *FileBackend) Initialize(ctx context.Context, passphrase string) error {
 		return fmt.Errorf("generate salt: %w", err)
 	}
 
+	zeroSecretMap(b.secrets)
 	b.salt = salt
+	zeroBytes(b.masterKey)
 	b.masterKey = deriveMasterKey(passphrase, salt)
 	b.secrets = make(map[string][]byte)
 
@@ -140,9 +142,12 @@ func (b *FileBackend) Unlock(ctx context.Context, passphrase string) error {
 	master := deriveMasterKey(passphrase, salt)
 	secrets, err := openSecrets(master, nonce, ciphertext)
 	if err != nil {
-		return fmt.Errorf("decrypt secrets: %w", err)
+		zeroBytes(master)
+		return err
 	}
 
+	zeroSecretMap(b.secrets)
+	zeroBytes(b.masterKey)
 	b.masterKey = master
 	b.salt = salt
 	b.secrets = secrets
@@ -162,6 +167,9 @@ func (b *FileBackend) StoreSecret(ctx context.Context, keyID string, secret []by
 		return ErrInvalidSecretID
 	}
 
+	if existing, ok := b.secrets[keyID]; ok {
+		zeroBytes(existing)
+	}
 	b.secrets[keyID] = append([]byte(nil), secret...)
 	if err := b.persist(); err != nil {
 		return fmt.Errorf("persist secret: %w", err)
@@ -192,7 +200,10 @@ func (b *FileBackend) DeleteSecret(ctx context.Context, keyID string) error {
 	if err := b.ensureUnlocked(); err != nil {
 		return err
 	}
-	delete(b.secrets, keyID)
+	if existing, ok := b.secrets[keyID]; ok {
+		zeroBytes(existing)
+		delete(b.secrets, keyID)
+	}
 	if err := b.persist(); err != nil {
 		return fmt.Errorf("persist keystore after delete: %w", err)
 	}
@@ -207,6 +218,10 @@ func (b *FileBackend) ensureUnlocked() error {
 }
 
 func (b *FileBackend) persist() error {
+	if err := b.ensureUnlocked(); err != nil {
+		return err
+	}
+
 	nonce, ciphertext, err := sealSecrets(b.masterKey, b.secrets)
 	if err != nil {
 		return err
@@ -250,16 +265,18 @@ func sealSecrets(masterKey []byte, secrets map[string][]byte) ([]byte, []byte, e
 		return nil, nil, fmt.Errorf("marshal secrets: %w", err)
 	}
 
-	nonce := make([]byte, defaultNonceLen)
+	aead, err := chacha20poly1305.NewX(masterKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("init cipher: %w", err)
+	}
+
+	nonce := make([]byte, nonceSize)
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, nil, fmt.Errorf("generate nonce: %w", err)
 	}
 
-	mask := blake2b.Sum256(append(masterKey, nonce...))
-	ciphertext := make([]byte, len(serialized))
-	for i, b := range serialized {
-		ciphertext[i] = b ^ mask[i%len(mask)]
-	}
+	ciphertext := aead.Seal(nil, nonce, serialized, nil)
+	zeroBytes(serialized)
 
 	return nonce, ciphertext, nil
 }
@@ -271,12 +288,20 @@ func openSecrets(masterKey, nonce, ciphertext []byte) (map[string][]byte, error)
 	if len(ciphertext) == 0 {
 		return map[string][]byte{}, nil
 	}
-
-	mask := blake2b.Sum256(append(masterKey, nonce...))
-	plaintext := make([]byte, len(ciphertext))
-	for i, b := range ciphertext {
-		plaintext[i] = b ^ mask[i%len(mask)]
+	if len(nonce) != nonceSize {
+		return nil, fmt.Errorf("invalid nonce size: %w", ErrInvalidPass)
 	}
+
+	aead, err := chacha20poly1305.NewX(masterKey)
+	if err != nil {
+		return nil, fmt.Errorf("init cipher: %w", err)
+	}
+
+	plaintext, err := aead.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt secrets: %w", ErrInvalidPass)
+	}
+	defer zeroBytes(plaintext)
 
 	var encoded map[string]string
 	if err := json.Unmarshal(plaintext, &encoded); err != nil {
@@ -293,4 +318,17 @@ func openSecrets(masterKey, nonce, ciphertext []byte) (map[string][]byte, error)
 	}
 
 	return out, nil
+}
+
+func zeroBytes(data []byte) {
+	for i := range data {
+		data[i] = 0
+	}
+}
+
+func zeroSecretMap(m map[string][]byte) {
+	for k, v := range m {
+		zeroBytes(v)
+		delete(m, k)
+	}
 }

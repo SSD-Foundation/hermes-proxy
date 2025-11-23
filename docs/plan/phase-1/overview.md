@@ -27,8 +27,8 @@ Deliver a single-node HERMES router that supports gRPC-based App connectivity an
 - Docs: README, release-notes entry, AGENT guardrails, wiki page for core node functionality, and iteration prompts.
 
 ## Current status
-- AppRouter.Open implements connect/start chat/send/delete on a single node with per-chat key erasure hooks into the keystore.
-- Component tests (in-process gRPC) cover happy path chat relay and signature failure; `make test` runs them and CI mirrors this job.
+- AppRouter.Open implements connect/start chat/send/delete on a single node with sealed keystore storage, per-chat secret zeroization, housekeeping for idle chats, and admin health/metrics endpoints.
+- Tests cover keystore sealing/tamper detection, chat routing (happy path + signature failure + idle expiry), and Dockerized integration (Compose harness with two mock apps). `make integration` exercises the container build + chat flow, and CI runs lint, tests, and the Compose integration job.
 
 ## Workstreams
 - **Protocols & contracts**: define `app_router.proto`; draft message envelopes for connect, chat setup, messaging, deletion, errors.
