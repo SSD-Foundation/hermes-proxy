@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestJoinAuthenticatesAndSharesSnapshot(t *testing.T) {
@@ -60,9 +61,9 @@ func TestJoinAuthenticatesAndSharesSnapshot(t *testing.T) {
 		t.Fatalf("expected node-a store to record node-b")
 	}
 
-	badReq := *req
+	badReq := proto.Clone(req).(*nodemeshpb.JoinRequest)
 	badReq.Signature = []byte("bad")
-	if _, err := client.Join(ctx, &badReq); status.Code(err) != codes.Unauthenticated {
+	if _, err := client.Join(ctx, badReq); status.Code(err) != codes.Unauthenticated {
 		t.Fatalf("expected unauthenticated for bad signature, got %v", err)
 	}
 }

@@ -41,6 +41,7 @@ type NodeServer struct {
 	meshStore   *mesh.Store
 	meshSvc     *mesh.Service
 	meshDialer  *mesh.Dialer
+	routes      *mesh.RouteClientPool
 	identity    mesh.Identity
 	ready       atomic.Bool
 }
@@ -104,7 +105,27 @@ func (s *NodeServer) Start(ctx context.Context) error {
 		HousekeepingInterval: s.cfg.Cleanup.SweepInterval,
 		NodeID:               s.cfg.Mesh.NodeID,
 		Apps:                 s.apps,
+		MeshStore:            s.meshStore,
 	})
+
+	routePool, err := mesh.NewRouteClientPool(mesh.RouteClientConfig{
+		Log:         s.log,
+		Store:       s.meshStore,
+		TLS:         meshTLSFromConfig(s.cfg.Mesh.TLS),
+		Handler:     router,
+		NodeID:      s.cfg.Mesh.NodeID,
+		DialTimeout: s.cfg.Mesh.Gossip.DialInterval,
+	})
+	if err != nil {
+		return fmt.Errorf("init route pool: %w", err)
+	}
+	s.routes = routePool
+	router.routes = routePool
+	router.store = s.meshStore
+	if s.meshSvc != nil {
+		s.meshSvc.AttachRouter(router)
+	}
+
 	router.StartHousekeeping(ctx)
 	approuterpb.RegisterAppRouterServer(s.grpcServer, router)
 	nodemeshpb.RegisterNodeMeshServer(s.grpcServer, s.meshSvc)

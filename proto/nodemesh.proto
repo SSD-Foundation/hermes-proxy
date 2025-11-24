@@ -76,19 +76,30 @@ message RouteFrame {
     RelayMessage relay_message = 3;
     TeardownTieline teardown_tieline = 4;
     RouteError error = 5;
+    RelayAck relay_ack = 6;
   }
 }
 
 message SetupTieline {
   string chat_id = 1;
-  string target_app_id = 2;
-  bytes payload = 3;
+  string source_app_id = 2;
+  string target_app_id = 3;
+  bytes source_ephemeral_key = 4;
+  bytes signature = 5;
+  map<string, string> metadata = 6;
+  string source_node_id = 7;
+  bytes source_public_key = 8;
 }
 
 message RelayMessage {
   string chat_id = 1;
   bytes payload = 2;
   uint64 sequence = 3;
+}
+
+message RelayAck {
+  string chat_id = 1;
+  uint64 sequence = 2;
 }
 
 message TeardownTieline {

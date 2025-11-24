@@ -4,12 +4,8 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/tls"
-	"crypto/x509"
 	"errors"
-	"fmt"
 	"io"
-	"os"
 	"sync"
 	"time"
 
@@ -17,8 +13,6 @@ import (
 	"github.com/hermes-proxy/hermes-proxy/pkg/api/nodemeshpb"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 // Peer describes a bootstrap candidate.
@@ -47,6 +41,9 @@ type DialerConfig struct {
 	Interval          time.Duration
 	HeartbeatInterval time.Duration
 	Metrics           *Metrics
+	SuspectAfter      time.Duration
+	EvictAfter        time.Duration
+	AppSyncInterval   time.Duration
 }
 
 // Dialer attempts to join bootstrap peers and maintain gossip streams.
@@ -59,10 +56,15 @@ type Dialer struct {
 	tlsCfg            TLSConfig
 	interval          time.Duration
 	heartbeatInterval time.Duration
+	suspectAfter      time.Duration
+	evictAfter        time.Duration
+	appSyncInterval   time.Duration
 	metrics           *Metrics
 
 	mu            sync.Mutex
 	gossipStarted map[string]bool
+	gossipCh      map[string]chan *nodemeshpb.GossipMessage
+	suspected     map[string]bool
 }
 
 // NewDialer builds a Dialer.
@@ -79,6 +81,15 @@ func NewDialer(cfg DialerConfig) (*Dialer, error) {
 	if cfg.HeartbeatInterval <= 0 {
 		cfg.HeartbeatInterval = 10 * time.Second
 	}
+	if cfg.AppSyncInterval <= 0 {
+		cfg.AppSyncInterval = cfg.HeartbeatInterval
+	}
+	if cfg.SuspectAfter <= 0 {
+		cfg.SuspectAfter = 3 * cfg.HeartbeatInterval
+	}
+	if cfg.EvictAfter <= 0 {
+		cfg.EvictAfter = 2 * cfg.SuspectAfter
+	}
 	return &Dialer{
 		log:               cfg.Log,
 		store:             cfg.Store,
@@ -88,14 +99,20 @@ func NewDialer(cfg DialerConfig) (*Dialer, error) {
 		tlsCfg:            cfg.TLS,
 		interval:          cfg.Interval,
 		heartbeatInterval: cfg.HeartbeatInterval,
+		suspectAfter:      cfg.SuspectAfter,
+		evictAfter:        cfg.EvictAfter,
+		appSyncInterval:   cfg.AppSyncInterval,
 		metrics:           cfg.Metrics,
 		gossipStarted:     make(map[string]bool),
+		gossipCh:          make(map[string]chan *nodemeshpb.GossipMessage),
+		suspected:         make(map[string]bool),
 	}, nil
 }
 
 // Start kicks off periodic join attempts until ctx is canceled.
 func (d *Dialer) Start(ctx context.Context) {
 	go d.loop(ctx)
+	go d.watchdog(ctx)
 }
 
 func (d *Dialer) loop(ctx context.Context) {
@@ -163,9 +180,16 @@ func (d *Dialer) startGossip(ctx context.Context, peer Peer) {
 		return
 	}
 	d.gossipStarted[peer.NodeID] = true
+	msgCh := make(chan *nodemeshpb.GossipMessage, 16)
+	d.gossipCh[peer.NodeID] = msgCh
 	d.mu.Unlock()
 
 	go func() {
+		defer func() {
+			d.mu.Lock()
+			delete(d.gossipCh, peer.NodeID)
+			d.mu.Unlock()
+		}()
 	reconnect:
 		for ctx.Err() == nil {
 			conn, err := d.dial(ctx, peer.Address)
@@ -185,10 +209,12 @@ func (d *Dialer) startGossip(ctx context.Context, peer Peer) {
 			}
 
 			ticker := time.NewTicker(d.heartbeatInterval)
+			appTicker := time.NewTicker(d.appSyncInterval)
 			for {
 				select {
 				case <-ctx.Done():
 					ticker.Stop()
+					appTicker.Stop()
 					conn.Close()
 					return
 				case <-ticker.C:
@@ -205,6 +231,37 @@ func (d *Dialer) startGossip(ctx context.Context, peer Peer) {
 							d.log.Warn("send heartbeat failed", zap.String("peer", peer.NodeID), zap.Error(err))
 						}
 						ticker.Stop()
+						appTicker.Stop()
+						conn.Close()
+						time.Sleep(d.interval)
+						continue reconnect
+					}
+				case <-appTicker.C:
+					if msg := d.buildAppSync(); msg != nil {
+						if err := stream.Send(msg); err != nil {
+							if !errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) {
+								d.log.Warn("send app sync failed", zap.String("peer", peer.NodeID), zap.Error(err))
+							}
+							ticker.Stop()
+							appTicker.Stop()
+							conn.Close()
+							time.Sleep(d.interval)
+							continue reconnect
+						}
+					}
+				case msg, ok := <-msgCh:
+					if !ok {
+						ticker.Stop()
+						appTicker.Stop()
+						conn.Close()
+						return
+					}
+					if err := stream.Send(msg); err != nil {
+						if !errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) {
+							d.log.Warn("send gossip message failed", zap.String("peer", peer.NodeID), zap.Error(err))
+						}
+						ticker.Stop()
+						appTicker.Stop()
 						conn.Close()
 						time.Sleep(d.interval)
 						continue reconnect
@@ -226,34 +283,7 @@ func (d *Dialer) dial(ctx context.Context, addr string) (*grpc.ClientConn, error
 }
 
 func (d *Dialer) transportCredentials() (grpc.DialOption, error) {
-	if !d.tlsCfg.Enabled {
-		return grpc.WithTransportCredentials(insecure.NewCredentials()), nil
-	}
-
-	if d.tlsCfg.CertPath == "" || d.tlsCfg.KeyPath == "" {
-		return nil, errors.New("tls enabled but cert/key paths are empty")
-	}
-	cert, err := tls.LoadX509KeyPair(d.tlsCfg.CertPath, d.tlsCfg.KeyPath)
-	if err != nil {
-		return nil, fmt.Errorf("load mesh tls cert: %w", err)
-	}
-
-	tlsCfg := &tls.Config{
-		Certificates:       []tls.Certificate{cert},
-		InsecureSkipVerify: d.tlsCfg.InsecureSkipVerify,
-	}
-	if d.tlsCfg.CAPath != "" {
-		pool := x509.NewCertPool()
-		caBytes, err := os.ReadFile(d.tlsCfg.CAPath)
-		if err != nil {
-			return nil, fmt.Errorf("read mesh ca: %w", err)
-		}
-		if ok := pool.AppendCertsFromPEM(caBytes); !ok {
-			return nil, errors.New("append mesh ca cert failed")
-		}
-		tlsCfg.RootCAs = pool
-	}
-	return grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)), nil
+	return dialTransportOption(d.tlsCfg)
 }
 
 func (d *Dialer) joinRequest() *nodemeshpb.JoinRequest {
@@ -286,4 +316,82 @@ func protoToMembers(p []*nodemeshpb.NodeDescriptor, now time.Time) []Member {
 		out = append(out, memberFromProto(m, now))
 	}
 	return out
+}
+
+func (d *Dialer) buildAppSync() *nodemeshpb.GossipMessage {
+	apps := d.localApps()
+	if len(apps) == 0 {
+		return nil
+	}
+	return &nodemeshpb.GossipMessage{
+		Body: &nodemeshpb.GossipMessage_AppSync{
+			AppSync: &nodemeshpb.AppSync{
+				NodeId: d.identity.Member.ID,
+				Apps:   appsToProto(apps),
+			},
+		},
+	}
+}
+
+func (d *Dialer) broadcast(msg *nodemeshpb.GossipMessage) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	for nodeID, ch := range d.gossipCh {
+		select {
+		case ch <- msg:
+		default:
+			d.log.Warn("gossip channel full, dropping update", zap.String("peer", nodeID))
+		}
+	}
+}
+
+func (d *Dialer) watchdog(ctx context.Context) {
+	if d.evictAfter <= 0 {
+		return
+	}
+	ticker := time.NewTicker(d.heartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			now := time.Now()
+			for _, member := range d.store.Snapshot() {
+				if member.ID == d.identity.Member.ID {
+					continue
+				}
+				elapsed := now.Sub(member.LastSeen)
+				if elapsed > d.suspectAfter {
+					if !d.suspected[member.ID] {
+						d.suspected[member.ID] = true
+						d.log.Warn("peer suspected", zap.String("node_id", member.ID), zap.Duration("last_seen_ago", elapsed))
+					}
+				} else {
+					delete(d.suspected, member.ID)
+				}
+			}
+
+			cutoff := now.Add(-d.evictAfter)
+			removed := d.store.EvictStale(cutoff)
+			if len(removed) == 0 {
+				continue
+			}
+			d.metrics.SetKnownNodes(len(d.store.Snapshot()))
+			for _, member := range removed {
+				delete(d.suspected, member.ID)
+				d.log.Warn("evicted stale peer", zap.String("node_id", member.ID))
+				d.broadcast(&nodemeshpb.GossipMessage{
+					Body: &nodemeshpb.GossipMessage_Membership{
+						Membership: &nodemeshpb.MembershipEvent{
+							Type: nodemeshpb.MembershipEvent_TYPE_FAIL,
+							Node: descriptorFromMember(member),
+						},
+					},
+				})
+			}
+		}
+	}
 }

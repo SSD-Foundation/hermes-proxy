@@ -45,6 +45,8 @@ func TestAppRouterHappyPath(t *testing.T) {
 	// handshake
 	app1Pub, app1Priv := mustKeypair(t)
 	app2Pub, app2Priv := mustKeypair(t)
+	app1ID := appIdentityKey(app1Pub)
+	app2ID := appIdentityKey(app2Pub)
 	nodeID := "node-1"
 
 	sendConnectFrame(t, stream1, nodeID, app1Pub, app1Priv, nil)
@@ -57,9 +59,9 @@ func TestAppRouterHappyPath(t *testing.T) {
 	chatID := "chat-123"
 	eph1 := mustRandBytes(t, 32)
 	eph2 := mustRandBytes(t, 32)
-	sendStartChat(t, stream1, chatID, eph1, app1Priv)
+	sendStartChat(t, stream1, chatID, app2ID, eph1, app1Priv)
 	expectStartChatAck(t, stream1, chatID)
-	sendStartChat(t, stream2, chatID, eph2, app2Priv)
+	sendStartChat(t, stream2, chatID, app1ID, eph2, app2Priv)
 	expectStartChatAck(t, stream2, chatID)
 
 	peer1 := waitForStartChat(t, stream1)
@@ -139,6 +141,7 @@ func TestStartChatSignatureFailure(t *testing.T) {
 		Body: &approuterpb.AppFrame_StartChat{
 			StartChat: &approuterpb.StartChat{
 				ChatId:                 "bad-chat",
+				TargetAppId:            "unknown",
 				PeerPublicEphemeralKey: mustRandBytes(t, 32),
 				Signature:              []byte{},
 			},
@@ -283,13 +286,14 @@ func sendConnectFrame(t *testing.T, stream approuterpb.AppRouter_OpenClient, nod
 	}
 }
 
-func sendStartChat(t *testing.T, stream approuterpb.AppRouter_OpenClient, chatID string, eph []byte, priv ed25519.PrivateKey) {
+func sendStartChat(t *testing.T, stream approuterpb.AppRouter_OpenClient, chatID, targetAppID string, eph []byte, priv ed25519.PrivateKey) {
 	t.Helper()
 	sig := ed25519.Sign(priv, eph)
 	if err := stream.Send(&approuterpb.AppFrame{
 		Body: &approuterpb.AppFrame_StartChat{
 			StartChat: &approuterpb.StartChat{
 				ChatId:                 chatID,
+				TargetAppId:            targetAppID,
 				PeerPublicEphemeralKey: eph,
 				Signature:              sig,
 			},

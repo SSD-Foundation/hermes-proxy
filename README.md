@@ -1,6 +1,6 @@
 # HERMES Nodes (Phase 2 – mesh bootstrap)
 
-This repository tracks the HERMES router nodes. Phase 1 delivers a gRPC-based service that connects Apps, manages encrypted 1:1 chats on a single node, and prepares the groundwork for the mesh, payments, and NAT features that follow. Phase 2 (in progress) layers NodeMesh membership, peer discovery, and cross-node routing on top of the existing chat plumbing. Platform target is Ubuntu Linux; the Phase 2 plan lives under `docs/plan/phase-2/`.
+This repository tracks the HERMES router nodes. Phase 1 delivers a gRPC-based service that connects Apps, manages encrypted 1:1 chats on a single node, and prepares the groundwork for the mesh, payments, and NAT features that follow. Phase 2 layers NodeMesh membership, peer discovery, and cross-node routing (implemented) on top of the existing chat plumbing. Platform target is Ubuntu Linux; the Phase 2 plan lives under `docs/plan/phase-2/`.
 
 ## Getting started
 - Read the MVP scope in `docs/hermes-mvp-revised.md`.
@@ -18,7 +18,7 @@ This repository tracks the HERMES router nodes. Phase 1 delivers a gRPC-based se
   - `make build` – build all packages.
   - `make integration` – build the Docker image and run the Compose harness (node + two mock apps).
   - `make proto` – regenerate gRPC stubs from `proto/app_router.proto` and `proto/nodemesh.proto`.
-  - `go test ./internal/server` – component tests for connect/start chat/send/delete happy path and signature failure.
+  - `go test ./internal/server` – component tests for connect/start chat/send/delete happy path, signature failure, and cross-node routing.
 
 ## Running the node
 The binary wires config, structured logging, keystore initialization, and the `AppRouter` gRPC service.
@@ -72,9 +72,10 @@ grpc_server:
 
 ## Mesh bootstrap
 - Node identity (ed25519) is stored in the sealed keystore under `mesh.identity_secret` and advertised during `NodeMesh.Join` alongside the node ID, wallet placeholder, and public endpoint.
-- Bootstrap peers are configured under `mesh.bootstrap_peers`; the dialer signs Join requests, validates peer signatures, merges membership snapshots, and opens a heartbeat `Gossip` stream with backoff.
-- Connected apps are registered in an in-memory discovery map keyed by app identity for future cross-node routing; the map is shared with peers during Join/AppSync.
-- TLS between nodes is configurable under `mesh.tls` (disabled by default for dev/test); when enabled the gRPC server uses the provided cert/key and optional CA for peer auth.
+- Bootstrap peers are configured under `mesh.bootstrap_peers`; the dialer signs Join requests, validates peer signatures, merges membership snapshots, and opens a heartbeat `Gossip` stream with backoff plus SWIM-like suspicion/eviction. Periodic AppSync frames propagate app presence updates.
+- Connected apps are registered in an in-memory discovery map keyed by app identity; the routing table merges local registrations with mesh AppSync/state for discovery and target resolution.
+- Node-to-node `RouteChat` streams are pooled per peer (TLS optional) to relay `SetupTieline`/`RelayMessage`/`TeardownTieline` envelopes with ACKs and backpressure handling.
+- TLS between nodes is configurable under `mesh.tls` (disabled by default for dev/test); when enabled the gRPC server uses the provided cert/key and optional CA for peer auth and the dialer/route pool reuse the same materials for outbound streams.
 
 ## Docker & integration harness
 - `docker-compose.dev.yaml` builds/runs the node plus two `mockapp` clients that exercise the happy-path chat flow. Run `make integration` to build the image, start the stack, wait for both apps to exit, and tear everything down.
@@ -98,12 +99,12 @@ grpc_server:
 - `AGENT.md`: Mandatory guardrails for testing, deployment, and docs maintenance.
 - `release-notes.md`: Latest user-visible changes.
 
-## AppRouter chat flow (single node)
-- Connect: app sends `Connect` with ed25519 identity pubkey and signature over node ID + metadata; node replies with `ConnectAck` and registers the session.
-- StartChat: each peer sends `StartChat` with `chat_id` and a signed ephemeral pubkey. When both are present the node relays the peer ephemeral key via a `StartChat` frame and acknowledges with `StartChatAck`.
-- SendChatMessage: AEAD ciphertext envelopes are relayed across the in-memory tieline; per-sender sequence numbers must be monotonic and are acknowledged with `ChatMessageAck`.
-- DeleteChat: caller triggers teardown and key erasure; both peers receive `DeleteChatAck` (`deleted` / `deleted_by_peer`).
-- Housekeeping: idle chats are expired by the server (`cleanup.chat_idle_timeout`) and return `DeleteChatAck` with `expired`; per-chat secrets and ephemeral keys are wiped from memory and the keystore.
+## AppRouter chat flow (single + cross-node)
+- Connect: app sends `Connect` with ed25519 identity pubkey and signature over node ID + metadata; node replies with `ConnectAck`, registers the session, and syncs app presence into the routing table.
+- StartChat: each peer sends `StartChat` with `chat_id`, `target_app_id` (optional `target_node_hint`), and a signed ephemeral pubkey. The node resolves the target via the routing table (local registry + mesh AppSync) and opens/joins a `RouteChat` tieline if the target lives on another node. `StartChatAck` is sent once accepted; the peer’s ephemeral key is delivered via a server-initiated `StartChat` frame once both keys are present. `FindApp` frames return the hosting node for a target app identity.
+- SendChatMessage: AEAD ciphertext envelopes are relayed locally or over `RouteChat`; per-sender sequence numbers must be monotonic. `ChatMessageAck` is emitted after the remote hop ACKs to preserve end-to-end backpressure across nodes.
+- DeleteChat: caller triggers teardown and key erasure; both peers receive `DeleteChatAck` (`deleted` / `deleted_by_peer`). Route loss or remote teardown returns `DeleteChatAck` with `route_closed`/`route_unavailable` as appropriate.
+- Housekeeping: idle chats are expired by the server (`cleanup.chat_idle_timeout`), propagate a remote teardown, and return `DeleteChatAck` with `expired`; per-chat secrets and ephemeral keys are wiped from memory and the keystore.
 - Heartbeat: echoed to keep the stream warm and track liveness.
 
 ## Contributing

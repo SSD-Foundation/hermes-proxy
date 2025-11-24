@@ -201,6 +201,57 @@ func (s *Store) Apps() []registry.AppPresence {
 	return out
 }
 
+// ResolveApp returns the stored presence for a target app.
+func (s *Store) ResolveApp(appID string) (registry.AppPresence, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	app, ok := s.apps[appID]
+	if !ok {
+		return registry.AppPresence{}, false
+	}
+	app.Metadata = cloneMetadata(app.Metadata)
+	return app, true
+}
+
+// RemoveAppsForNode evicts app entries hosted on a given node.
+func (s *Store) RemoveAppsForNode(nodeID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	removed := 0
+	for id, app := range s.apps {
+		if app.NodeID == nodeID {
+			delete(s.apps, id)
+			removed++
+		}
+	}
+	return removed
+}
+
+// EvictStale removes members that have not heartbeated since the cutoff time.
+func (s *Store) EvictStale(cutoff time.Time) []Member {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var removed []Member
+	for id, member := range s.members {
+		if id == s.self.ID {
+			continue
+		}
+		if member.LastSeen.Before(cutoff) {
+			delete(s.members, id)
+			removed = append(removed, cloneMember(member))
+			for appID, app := range s.apps {
+				if app.NodeID == id {
+					delete(s.apps, appID)
+				}
+			}
+		}
+	}
+	return removed
+}
+
 func cloneMember(in Member) Member {
 	cp := in
 	cp.Metadata = cloneMetadata(in.Metadata)

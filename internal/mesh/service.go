@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/hermes-proxy/hermes-proxy/pkg/api/nodemeshpb"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -24,6 +26,7 @@ type Service struct {
 	metrics *Metrics
 	apps    registry.AppRegistry
 	self    Identity
+	router  RouteHandler
 }
 
 // ServiceConfig wires dependencies for the NodeMesh service.
@@ -33,6 +36,7 @@ type ServiceConfig struct {
 	Metrics  *Metrics
 	Apps     registry.AppRegistry
 	Identity Identity
+	Router   RouteHandler
 }
 
 // NewService constructs the NodeMesh service.
@@ -52,6 +56,7 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 		metrics: cfg.Metrics,
 		apps:    cfg.Apps,
 		self:    cfg.Identity,
+		router:  cfg.Router,
 	}, nil
 }
 
@@ -147,8 +152,73 @@ func (s *Service) Gossip(stream nodemeshpb.NodeMesh_GossipServer) error {
 }
 
 // RouteChat is not yet implemented in iteration 01.
-func (s *Service) RouteChat(nodemeshpb.NodeMesh_RouteChatServer) error {
-	return status.Error(codes.Unimplemented, "route chat not implemented yet")
+func (s *Service) RouteChat(stream nodemeshpb.NodeMesh_RouteChatServer) error {
+	if s.router == nil {
+		return status.Error(codes.Unimplemented, "route handler not configured")
+	}
+
+	ctx := stream.Context()
+	peerNode := peerNodeFromContext(ctx)
+	defer s.router.HandleRouteClosed(peerNode)
+
+	for {
+		frame, err := stream.Recv()
+		if err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
+				return nil
+			}
+			return err
+		}
+
+		if peerNode == "" {
+			if setup := frame.GetSetupTieline(); setup != nil && setup.SourceNodeId != "" {
+				peerNode = setup.SourceNodeId
+			}
+		}
+
+		resp, handleErr := s.router.HandleRouteFrame(ctx, peerNode, frame)
+		if handleErr != nil {
+			var rerr *RouteError
+			if errors.As(handleErr, &rerr) {
+				_ = stream.Send(&nodemeshpb.RouteFrame{
+					CorrelationId: frame.GetCorrelationId(),
+					Body: &nodemeshpb.RouteFrame_Error{
+						Error: &nodemeshpb.RouteError{Code: rerr.Code, Message: rerr.Msg},
+					},
+				})
+				if rerr.Fatal {
+					return status.Error(codes.PermissionDenied, rerr.Msg)
+				}
+				continue
+			}
+			return handleErr
+		}
+
+		if resp != nil {
+			if resp.CorrelationId == "" {
+				resp.CorrelationId = frame.GetCorrelationId()
+			}
+			if err := stream.Send(resp); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// AttachRouter wires the RouteChat handler after construction.
+func (s *Service) AttachRouter(handler RouteHandler) {
+	s.router = handler
+}
+
+func peerNodeFromContext(ctx context.Context) string {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return ""
+	}
+	if vals := md.Get("node-id"); len(vals) > 0 {
+		return vals[0]
+	}
+	return ""
 }
 
 func validateDescriptor(node *nodemeshpb.NodeDescriptor) error {

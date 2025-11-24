@@ -70,4 +70,28 @@ func TestStoreMergeMembersAndApps(t *testing.T) {
 			t.Fatalf("expected local app to be keyed to self, got node %s", app.NodeID)
 		}
 	}
+
+	if _, ok := store.ResolveApp("app-1"); !ok {
+		t.Fatalf("expected to resolve remote app")
+	}
+	removed := store.RemoveAppsForNode("peer-1")
+	if removed != 1 {
+		t.Fatalf("expected to drop one app for peer-1, got %d", removed)
+	}
+	if _, ok := store.ResolveApp("app-1"); ok {
+		t.Fatalf("expected remote app to be evicted")
+	}
+
+	stale := Member{
+		ID:          "stale-peer",
+		Endpoint:    "10.0.0.3:50051",
+		IdentityKey: bytes.Repeat([]byte{3}, ed25519.PublicKeySize),
+		LastSeen:    now.Add(-time.Hour),
+	}
+	store.Upsert(stale, stale.LastSeen)
+	staleCutoff := time.Now().Add(-30 * time.Minute)
+	removedMembers := store.EvictStale(staleCutoff)
+	if len(removedMembers) != 1 || removedMembers[0].ID != "stale-peer" {
+		t.Fatalf("expected stale peer evicted, got %+v", removedMembers)
+	}
 }
