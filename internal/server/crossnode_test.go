@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hermes-proxy/hermes-proxy/internal/keystore"
 	"github.com/hermes-proxy/hermes-proxy/internal/mesh"
 	"github.com/hermes-proxy/hermes-proxy/internal/registry"
 	"github.com/hermes-proxy/hermes-proxy/pkg/api/approuterpb"
@@ -64,8 +65,8 @@ func TestCrossNodeRoutingHappyPath(t *testing.T) {
 	nodeB.store.MergeApps(nodeA.store.Apps(), now)
 
 	chatID := "cross-node-chat"
-	ephA := mustRandBytes(t, 32)
-	ephB := mustRandBytes(t, 32)
+	ephA := mustEphemeral(t)
+	ephB := mustEphemeral(t)
 
 	sendStartChat(t, streamA, chatID, appBID, ephA, appAPriv)
 	expectStartChatAck(t, streamA, chatID)
@@ -73,12 +74,40 @@ func TestCrossNodeRoutingHappyPath(t *testing.T) {
 	expectStartChatAck(t, streamB, chatID)
 
 	peerA := waitForStartChat(t, streamA)
-	if !bytes.Equal(peerA.PeerPublicEphemeralKey, ephB) {
-		t.Fatalf("node A expected peer key %x, got %x", ephB, peerA.PeerPublicEphemeralKey)
+	if !bytes.Equal(peerA.LocalEphemeralPublicKey, ephB.Public) {
+		t.Fatalf("node A expected peer key %x, got %x", ephB.Public, peerA.LocalEphemeralPublicKey)
 	}
 	peerB := waitForStartChat(t, streamB)
-	if !bytes.Equal(peerB.PeerPublicEphemeralKey, ephA) {
-		t.Fatalf("node B expected peer key %x, got %x", ephA, peerB.PeerPublicEphemeralKey)
+	if !bytes.Equal(peerB.LocalEphemeralPublicKey, ephA.Public) {
+		t.Fatalf("node B expected peer key %x, got %x", ephA.Public, peerB.LocalEphemeralPublicKey)
+	}
+	if peerA.KeyVersion != 1 || peerB.KeyVersion != 1 {
+		t.Fatalf("expected key version 1, got %d and %d", peerA.KeyVersion, peerB.KeyVersion)
+	}
+	if peerA.HkdfInfo != "hermes-chat-session" || peerB.HkdfInfo != "hermes-chat-session" {
+		t.Fatalf("unexpected hkdf info in remote start chat")
+	}
+	waitForSecret := func(ks *memoryKeystore, id string) keystore.ChatSecretRecord {
+		for i := 0; i < 10; i++ {
+			if ks.has(id) {
+				rec, err := ks.LoadChatSecret(context.Background(), id)
+				if err == nil {
+					return rec
+				}
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		return keystore.ChatSecretRecord{}
+	}
+	if rec := waitForSecret(nodeA.ks, chatID); rec.ChatID == "" {
+		t.Fatalf("nodeA expected chat secret")
+	} else if rec.KeyVersion != 1 {
+		t.Fatalf("nodeA expected key version 1, got %d", rec.KeyVersion)
+	}
+	if rec := waitForSecret(nodeB.ks, chatID); rec.ChatID == "" {
+		t.Fatalf("nodeB expected chat secret")
+	} else if rec.KeyVersion != 1 {
+		t.Fatalf("nodeB expected key version 1, got %d", rec.KeyVersion)
 	}
 
 	payload := []byte("0123456789abcdefpayload")
@@ -136,15 +165,20 @@ func TestCrossNodeUnknownTarget(t *testing.T) {
 	sendConnectFrame(t, stream, nodeA.id, appPub, appPriv, nil)
 	expectConnectAck(t, stream)
 
-	eph := mustRandBytes(t, 32)
+	eph := mustEphemeral(t)
+	appID := appIdentityKey(appPub)
+	payload := handshakePayload("missing-chat", appID, "missing-target", eph.Public, nil, "hermes-chat-session", 1, false)
 	if err := stream.Send(&approuterpb.AppFrame{
 		Body: &approuterpb.AppFrame_StartChat{
 			StartChat: &approuterpb.StartChat{
-				ChatId:                 "missing-chat",
-				TargetAppId:            "missing-target",
-				TargetNodeHint:         "missing-node",
-				PeerPublicEphemeralKey: eph,
-				Signature:              ed25519.Sign(appPriv, eph),
+				ChatId:                   "missing-chat",
+				TargetAppId:              "missing-target",
+				TargetNodeHint:           "missing-node",
+				LocalEphemeralPublicKey:  eph.Public,
+				LocalEphemeralPrivateKey: eph.Private,
+				Signature:                ed25519.Sign(appPriv, payload),
+				KeyVersion:               1,
+				HkdfInfo:                 "hermes-chat-session",
 			},
 		},
 	}); err != nil {
@@ -215,9 +249,9 @@ func TestCrossNodeRouteLossTriggersTeardown(t *testing.T) {
 	nodeB.store.MergeApps(nodeA.store.Apps(), now)
 
 	chatID := "route-loss"
-	sendStartChat(t, streamA, chatID, appBID, mustRandBytes(t, 32), appAPriv)
+	sendStartChat(t, streamA, chatID, appBID, mustEphemeral(t), appAPriv)
 	expectStartChatAck(t, streamA, chatID)
-	sendStartChat(t, streamB, chatID, appAID, mustRandBytes(t, 32), appBPriv)
+	sendStartChat(t, streamB, chatID, appAID, mustEphemeral(t), appBPriv)
 	expectStartChatAck(t, streamB, chatID)
 
 	_ = waitForStartChat(t, streamA)

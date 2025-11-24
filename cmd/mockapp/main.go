@@ -6,12 +6,14 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
 	"time"
 
+	"github.com/hermes-proxy/hermes-proxy/internal/crypto/pfs"
 	"github.com/hermes-proxy/hermes-proxy/pkg/api/approuterpb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -29,6 +31,7 @@ type appConfig struct {
 	timeout      time.Duration
 	identitySeed string
 	peerSeed     string
+	messages     int
 }
 
 func main() {
@@ -44,6 +47,7 @@ func parseConfig() appConfig {
 	var payload string
 	var identitySeed string
 	var peerSeed string
+	var messages int
 	flag.StringVar(&cfg.nodeAddr, "node", "127.0.0.1:50051", "gRPC address for the node")
 	flag.StringVar(&cfg.nodeID, "node-id", "hermes-dev", "Node ID used in Connect signatures")
 	flag.StringVar(&cfg.chatID, "chat-id", "integration-chat", "Chat identifier to join")
@@ -52,6 +56,7 @@ func parseConfig() appConfig {
 	flag.StringVar(&identitySeed, "identity-seed", "", "Optional seed for deterministic identity generation")
 	flag.StringVar(&peerSeed, "peer-seed", "", "Optional seed for peer identity when target-app is empty")
 	flag.StringVar(&payload, "payload", "integration-payload-012345", "Ciphertext payload to relay")
+	flag.IntVar(&messages, "messages", 2, "Number of messages to send before teardown (sender only)")
 	flag.DurationVar(&cfg.timeout, "timeout", 30*time.Second, "Overall timeout for the chat flow")
 	flag.Parse()
 
@@ -63,6 +68,10 @@ func parseConfig() appConfig {
 
 	cfg.identitySeed = identitySeed
 	cfg.peerSeed = peerSeed
+	if messages <= 0 {
+		messages = 1
+	}
+	cfg.messages = messages
 
 	if cfg.target == "" {
 		if cfg.identitySeed == "" {
@@ -115,8 +124,8 @@ func run(cfg appConfig) error {
 		return err
 	}
 
-	eph := make([]byte, 32)
-	if _, err := rand.Read(eph); err != nil {
+	eph, err := pfs.GenerateKeyPair(rand.Reader)
+	if err != nil {
 		return fmt.Errorf("ephemeral key: %w", err)
 	}
 	if err := sendStartChat(stream, cfg.chatID, cfg.target, eph, priv); err != nil {
@@ -128,14 +137,15 @@ func run(cfg appConfig) error {
 
 func handleFrames(ctx context.Context, stream approuterpb.AppRouter_OpenClient, cfg appConfig) error {
 	var (
-		gotAck       bool
-		gotPeer      bool
-		msgAck       bool
-		sentMessage  bool
-		sentDelete   bool
-		gotDeleteAck bool
-		receivedMsg  bool
+		gotAck        bool
+		gotPeer       bool
+		sentDelete    bool
+		gotDeleteAck  bool
+		sentCount     int
+		ackCount      int
+		receivedCount int
 	)
+	nextSeq := uint64(1)
 
 	for {
 		frame, err := stream.Recv()
@@ -152,23 +162,41 @@ func handleFrames(ctx context.Context, stream approuterpb.AppRouter_OpenClient, 
 		case *approuterpb.AppFrame_StartChat:
 			gotPeer = true
 		case *approuterpb.AppFrame_ChatMessageAck:
-			msgAck = true
+			if cfg.role == "sender" {
+				ackCount++
+				if ackCount < cfg.messages {
+					nextSeq++
+					if err := sendChatMessage(stream, cfg.chatID, cfg.payload, nextSeq); err != nil {
+						return err
+					}
+					sentCount++
+				} else if !sentDelete {
+					if err := sendDelete(stream, cfg.chatID, "integration-finished"); err != nil {
+						return err
+					}
+					sentDelete = true
+				}
+			}
 		case *approuterpb.AppFrame_ChatMessage:
 			if cfg.role == "receiver" {
 				if !bytes.Equal(body.ChatMessage.Payload, cfg.payload) {
 					return fmt.Errorf("received payload mismatch: %x vs %x", body.ChatMessage.Payload, cfg.payload)
 				}
-				receivedMsg = true
+				receivedCount++
 			}
 		case *approuterpb.AppFrame_DeleteChatAck:
 			gotDeleteAck = true
 			switch cfg.role {
 			case "sender":
-				if body.DeleteChatAck.Status != "deleted" {
+				switch body.DeleteChatAck.Status {
+				case "deleted", "rekey_required", "ratchet_desync":
+				default:
 					return fmt.Errorf("unexpected delete status %s", body.DeleteChatAck.Status)
 				}
 			case "receiver":
-				if body.DeleteChatAck.Status != "deleted_by_peer" && body.DeleteChatAck.Status != "expired" {
+				switch body.DeleteChatAck.Status {
+				case "deleted_by_peer", "expired", "ratchet_desync", "rekey_required", "route_closed", "route_unavailable":
+				default:
 					return fmt.Errorf("unexpected delete status %s", body.DeleteChatAck.Status)
 				}
 			}
@@ -178,24 +206,17 @@ func handleFrames(ctx context.Context, stream approuterpb.AppRouter_OpenClient, 
 			continue
 		}
 
-		if cfg.role == "sender" && gotAck && gotPeer && !sentMessage {
-			if err := sendChatMessage(stream, cfg.chatID, cfg.payload); err != nil {
+		if cfg.role == "sender" && gotAck && gotPeer && sentCount == 0 {
+			if err := sendChatMessage(stream, cfg.chatID, cfg.payload, nextSeq); err != nil {
 				return err
 			}
-			sentMessage = true
-		}
-
-		if cfg.role == "sender" && sentMessage && msgAck && !sentDelete {
-			if err := sendDelete(stream, cfg.chatID, "integration-finished"); err != nil {
-				return err
-			}
-			sentDelete = true
+			sentCount++
 		}
 
 		if cfg.role == "sender" && gotDeleteAck {
 			return nil
 		}
-		if cfg.role == "receiver" && receivedMsg && gotDeleteAck {
+		if cfg.role == "receiver" && receivedCount >= cfg.messages && gotDeleteAck {
 			return nil
 		}
 	}
@@ -225,27 +246,33 @@ func expectConnectAck(stream approuterpb.AppRouter_OpenClient) error {
 	return nil
 }
 
-func sendStartChat(stream approuterpb.AppRouter_OpenClient, chatID, target string, eph []byte, priv ed25519.PrivateKey) error {
-	sig := ed25519.Sign(priv, eph)
+func sendStartChat(stream approuterpb.AppRouter_OpenClient, chatID, target string, eph pfs.KeyPair, priv ed25519.PrivateKey) error {
+	appID := hex.EncodeToString(priv.Public().(ed25519.PublicKey))
+	info := "hermes-chat-session"
+	payload := startPayload(chatID, appID, target, eph.Public, nil, info, 1, false)
+	sig := ed25519.Sign(priv, payload)
 	return stream.Send(&approuterpb.AppFrame{
 		Body: &approuterpb.AppFrame_StartChat{
 			StartChat: &approuterpb.StartChat{
-				ChatId:                 chatID,
-				TargetAppId:            target,
-				PeerPublicEphemeralKey: eph,
-				Signature:              sig,
+				ChatId:                   chatID,
+				TargetAppId:              target,
+				LocalEphemeralPublicKey:  eph.Public,
+				LocalEphemeralPrivateKey: eph.Private,
+				Signature:                sig,
+				KeyVersion:               1,
+				HkdfInfo:                 info,
 			},
 		},
 	})
 }
 
-func sendChatMessage(stream approuterpb.AppRouter_OpenClient, chatID string, payload []byte) error {
+func sendChatMessage(stream approuterpb.AppRouter_OpenClient, chatID string, payload []byte, seq uint64) error {
 	return stream.Send(&approuterpb.AppFrame{
 		Body: &approuterpb.AppFrame_ChatMessage{
 			ChatMessage: &approuterpb.ChatMessage{
 				ChatId:   chatID,
 				Payload:  payload,
-				Sequence: 1,
+				Sequence: seq,
 			},
 		},
 	})
@@ -257,6 +284,32 @@ func sendDelete(stream approuterpb.AppRouter_OpenClient, chatID, reason string) 
 			DeleteChat: &approuterpb.DeleteChat{ChatId: chatID, Reason: reason},
 		},
 	})
+}
+
+func startPayload(chatID, sourceAppID, targetAppID string, public, hkdfSalt []byte, hkdfInfo string, version uint32, rekey bool) []byte {
+	var ver [4]byte
+	binary.BigEndian.PutUint32(ver[:], version)
+
+	buf := bytes.Buffer{}
+	buf.WriteString(chatID)
+	buf.WriteByte(0)
+	buf.WriteString(sourceAppID)
+	buf.WriteByte(0)
+	buf.WriteString(targetAppID)
+	buf.WriteByte(0)
+	buf.Write(public)
+	buf.WriteByte(0)
+	buf.Write(hkdfSalt)
+	buf.WriteByte(0)
+	buf.WriteString(hkdfInfo)
+	buf.WriteByte(0)
+	buf.Write(ver[:])
+	if rekey {
+		buf.WriteByte(1)
+	} else {
+		buf.WriteByte(0)
+	}
+	return buf.Bytes()
 }
 
 func deriveKey(seed string) (ed25519.PublicKey, ed25519.PrivateKey) {

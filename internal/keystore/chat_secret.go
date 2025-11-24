@@ -30,12 +30,16 @@ type ChatSecretRecord struct {
 	LocalPublic    []byte    `json:"local_public,omitempty"`
 	RemotePublic   []byte    `json:"remote_public,omitempty"`
 	LocalPrivate   []byte    `json:"local_private,omitempty"`
+	LocalAppID     string    `json:"local_app_id,omitempty"`
+	RemoteAppID    string    `json:"remote_app_id,omitempty"`
 	HKDFSalt       []byte    `json:"hkdf_salt,omitempty"`
 	HKDFInfo       []byte    `json:"hkdf_info,omitempty"`
 	SendKey        []byte    `json:"send_key,omitempty"`
 	RecvKey        []byte    `json:"recv_key,omitempty"`
 	MACKey         []byte    `json:"mac_key,omitempty"`
 	RatchetSeed    []byte    `json:"ratchet_seed,omitempty"`
+	SendCount      uint64    `json:"send_count,omitempty"`
+	RecvCount      uint64    `json:"recv_count,omitempty"`
 	CreatedAt      time.Time `json:"created_at"`
 	RotatedAt      time.Time `json:"rotated_at,omitempty"`
 	LegacyCombined []byte    `json:"legacy_combined,omitempty"`
@@ -47,6 +51,8 @@ func (c ChatSecretRecord) Clone() ChatSecretRecord {
 	out.LocalPublic = cloneBytes(c.LocalPublic)
 	out.RemotePublic = cloneBytes(c.RemotePublic)
 	out.LocalPrivate = cloneBytes(c.LocalPrivate)
+	out.LocalAppID = c.LocalAppID
+	out.RemoteAppID = c.RemoteAppID
 	out.HKDFSalt = cloneBytes(c.HKDFSalt)
 	out.HKDFInfo = cloneBytes(c.HKDFInfo)
 	out.SendKey = cloneBytes(c.SendKey)
@@ -69,6 +75,10 @@ func (c *ChatSecretRecord) Zero() {
 	zeroBytes(c.MACKey)
 	zeroBytes(c.RatchetSeed)
 	zeroBytes(c.LegacyCombined)
+	c.LocalAppID = ""
+	c.RemoteAppID = ""
+	c.SendCount = 0
+	c.RecvCount = 0
 }
 
 func normalizeChatSecret(in ChatSecretRecord, now time.Time) (ChatSecretRecord, error) {
@@ -142,6 +152,7 @@ func validateKeySize(key []byte, field string) error {
 
 func chatSecretSize(rec ChatSecretRecord) int {
 	total := len(rec.ChatID) + len(rec.LocalKeyID) + len(rec.RemoteKeyID)
+	total += len(rec.LocalAppID) + len(rec.RemoteAppID)
 	total += len(rec.LocalPublic) + len(rec.RemotePublic) + len(rec.LocalPrivate)
 	total += len(rec.HKDFSalt) + len(rec.HKDFInfo)
 	total += len(rec.SendKey) + len(rec.RecvKey) + len(rec.MACKey) + len(rec.RatchetSeed)

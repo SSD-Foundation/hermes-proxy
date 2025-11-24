@@ -89,6 +89,10 @@ message SetupTieline {
   map<string, string> metadata = 6;
   string source_node_id = 7;
   bytes source_public_key = 8;
+  uint32 key_version = 9;
+  bytes hkdf_salt = 10;
+  string hkdf_info = 11;
+  bool rekey = 12;
 }
 
 message RelayMessage {

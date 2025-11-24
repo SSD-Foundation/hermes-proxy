@@ -51,11 +51,16 @@ message ConnectAck {
 // StartChat initiates a chat with a peer connected to the same node.
 message StartChat {
   string chat_id = 1;
-  bytes peer_public_ephemeral_key = 2;
+  bytes local_ephemeral_public_key = 2;
   bytes signature = 3;
   map<string, string> metadata = 4;
   string target_app_id = 5;
   string target_node_hint = 6;
+  bytes local_ephemeral_private_key = 7;
+  uint32 key_version = 8;
+  bytes hkdf_salt = 9;
+  string hkdf_info = 10;
+  bool rekey = 11;
 }
 
 // StartChatAck acknowledges chat initialization.

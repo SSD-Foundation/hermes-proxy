@@ -1,6 +1,6 @@
 # HERMES Nodes (Phase 2 – mesh bootstrap)
 
-This repository tracks the HERMES router nodes. Phase 1 delivers a gRPC-based service that connects Apps, manages encrypted 1:1 chats on a single node, and prepares the groundwork for the mesh, payments, and NAT features that follow. Phase 2 layers NodeMesh membership, peer discovery, and cross-node routing (implemented) on top of the existing chat plumbing. Phase 3 (per-chat PFS with signed X25519 exchange, HKDF-derived session keys, and ratcheting) is now planned in `docs/plan/phase-3/` while implementation is in progress. Platform target is Ubuntu Linux; the Phase 2 plan lives under `docs/plan/phase-2/`.
+This repository tracks the HERMES router nodes. Phase 1 delivers a gRPC-based service that connects Apps, manages encrypted 1:1 chats on a single node, and prepares the groundwork for the mesh, payments, and NAT features that follow. Phase 2 layers NodeMesh membership, peer discovery, and cross-node routing (implemented) on top of the existing chat plumbing. Phase 3 (per-chat PFS with signed X25519 exchange, HKDF-derived session keys, and ratcheting) is underway: iteration 02 landed the signed X25519/HKDF handshake and iteration 03 adds per-message ratchets, teardown on divergence/expiry, admin visibility, and coverage per `docs/plan/phase-3/`. Platform target is Ubuntu Linux; the Phase 2 plan lives under `docs/plan/phase-2/`.
 
 ## Getting started
 - Read the MVP scope in `docs/hermes-mvp-revised.md`.
@@ -28,7 +28,7 @@ export HERMES_KEYSTORE_PASSPHRASE=change-me
 go run ./cmd/node --config config/dev.yaml
 ```
 
-If the keystore file does not exist, it is initialized automatically at the configured path. A small admin HTTP server (default `:8080`) serves `GET /healthz`, `GET /readyz`, Prometheus metrics at `GET /metrics`, and a membership dump at `GET /mesh/members` for mesh debugging. Mesh metrics include node counts, join/app sync counters, and churn visibility (`hermes_mesh_suspected_peers`, `hermes_mesh_evicted_peers_total`).
+If the keystore file does not exist, it is initialized automatically at the configured path. A small admin HTTP server (default `:8080`) serves `GET /healthz`, `GET /readyz`, Prometheus metrics at `GET /metrics`, a membership dump at `GET /mesh/members`, and ratchet status at `GET /crypto/ratchets` (non-secret counters/versions) for crypto debugging. Mesh metrics include node counts, join/app sync counters, and churn visibility (`hermes_mesh_suspected_peers`, `hermes_mesh_evicted_peers_total`); router metrics now include ratchet/erasure counters.
 
 ## Configuration
 Configuration is read from a file plus environment overrides (`HERMES_` prefix). Example:
@@ -89,7 +89,7 @@ Crypto parameters govern the HKDF hash/info label used for per-chat derivation a
 - TLS between nodes is configurable under `mesh.tls` (disabled by default for dev/test); when enabled the gRPC server uses the provided cert/key and optional CA for peer auth and the dialer/route pool reuse the same materials for outbound streams.
 
 ## Docker & integration harness
-- `docker-compose.dev.yaml` builds/runs the node plus two `mockapp` clients that exercise the happy-path chat flow. Run `make integration` to build the image, start the stack, wait for both apps to exit, and tear everything down.
+- `docker-compose.dev.yaml` builds/runs the node plus two `mockapp` clients that exercise the happy-path chat flow (two messages per chat by default to advance ratchets; override with `--messages`). Run `make integration` to build the image, start the stack, wait for both apps to exit, and tear everything down.
 - The image produced by `Dockerfile` contains both binaries (`node` and `mockapp`), listens on `50051` for gRPC and `8080` for health/metrics, and persists the keystore to `/app/data` (Compose mounts a named volume).
 - The admin endpoints exposed in the container are the same as local runs: `/healthz`, `/readyz`, `/metrics`.
 
@@ -115,8 +115,8 @@ Crypto parameters govern the HKDF hash/info label used for per-chat derivation a
 ## AppRouter chat flow (single + cross-node)
 - Connect: app sends `Connect` with ed25519 identity pubkey and signature over node ID + metadata; node replies with `ConnectAck`, registers the session, and syncs app presence into the routing table.
 - StartChat: each peer sends `StartChat` with `chat_id`, `target_app_id` (optional `target_node_hint`), and a signed ephemeral pubkey. The node resolves the target via the routing table (local registry + mesh AppSync) and opens/joins a `RouteChat` tieline if the target lives on another node. `StartChatAck` is sent once accepted; the peer’s ephemeral key is delivered via a server-initiated `StartChat` frame once both keys are present. `FindApp` frames return the hosting node for a target app identity.
-- SendChatMessage: AEAD ciphertext envelopes are relayed locally or over `RouteChat`; per-sender sequence numbers must be monotonic. `ChatMessageAck` is emitted after the remote hop ACKs to preserve end-to-end backpressure across nodes.
-- DeleteChat: caller triggers teardown and key erasure; both peers receive `DeleteChatAck` (`deleted` / `deleted_by_peer`). Route loss or remote teardown returns `DeleteChatAck` with `route_closed`/`route_unavailable` as appropriate.
+- SendChatMessage: AEAD ciphertext envelopes are relayed locally or over `RouteChat`; per-sender sequence numbers must be monotonic and drive symmetric ratchets. Ratchet state (send/recv counters) is sealed in the keystore and advanced on each message; divergence returns `RATCHET_DESYNC` + `DeleteChatAck` with `ratchet_desync` and erases secrets locally/remote. Keys that exceed `crypto.max_key_lifetime` trigger `rekey_required` teardowns. `ChatMessageAck` is emitted after the remote hop ACKs to preserve end-to-end backpressure across nodes.
+- DeleteChat: caller triggers teardown and key erasure; both peers receive `DeleteChatAck` (`deleted` / `deleted_by_peer`). Route loss or remote teardown returns `DeleteChatAck` with `route_closed`/`route_unavailable` as appropriate. Ratchet failures/expiry return `ratchet_desync`/`rekey_required`.
 - Housekeeping: idle chats are expired by the server (`cleanup.chat_idle_timeout`), propagate a remote teardown, and return `DeleteChatAck` with `expired`; per-chat secrets and ephemeral keys are wiped from memory and the keystore.
 - Heartbeat: echoed to keep the stream warm and track liveness.
 

@@ -15,5 +15,5 @@ Wire the upgraded protocols through AppRouter and NodeMesh so StartChat/rekey ex
 - Derived session material is sealed in the keystore per chat with version tracking; chat state transitions account for local and cross-node flows.
 - Component tests (single-node and two-node) cover happy-path handshake, invalid signature, replay/mismatch, and teardown on derivation failure.
 
-## Status update (2025-11-25)
-- Planned; awaiting keystore/crypto helpers from Iteration 01 before wiring protocols and handlers.
+## Status update (2025-11-26)
+- Implemented: protos now carry key_version/HKDF salt+info/rekey flags, AppRouter/NodeMesh validate signed X25519 keys, derive HKDF send/recv/mac/ratchet seeds into the keystore (local + cross-node), reject replays/mismatches deterministically, and updated mockapp/component tests exercise the new handshake.

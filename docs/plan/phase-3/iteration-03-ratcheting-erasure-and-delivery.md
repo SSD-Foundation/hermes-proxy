@@ -15,5 +15,5 @@ Complete the PFS lifecycle with symmetric ratchets, deterministic erasure, and o
 - Secrets are erased on all teardown paths (explicit delete, expiry, churn, shutdown) with metrics/logs confirming wipes; no plaintext or key material is logged.
 - Integration (Compose + CI) runs the PFS + ratchet flow across two nodes and mock apps, including rekey and teardown; documentation and guardrails describe the new workflows and operational knobs.
 
-## Status update (2025-11-25)
-- Planned; depends on Iterations 01–02 for record formats and handshake wiring before ratcheting and operational hardening can land.
+## Status update (2025-11-27)
+- Ratchet state now persists and advances per message with teardown on divergence/expired lifetimes, Prometheus/HTTP visibility shipped, and mockapp/component coverage exercises multi-message flows; continue hardening rekey/backpressure where needed.
