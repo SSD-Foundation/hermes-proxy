@@ -1051,7 +1051,13 @@ func (s *AppRouterService) persistChatSecret(chatID string, keys [][]byte) {
 	}
 	combined := bytes.Join(keys, []byte(":"))
 	defer zeroBytes(combined)
-	if err := s.keystore.StoreSecret(context.Background(), chatID, combined); err != nil {
+	record := keystore.ChatSecretRecord{
+		ChatID:         chatID,
+		KeyVersion:     1,
+		LegacyCombined: combined,
+		CreatedAt:      time.Now().UTC(),
+	}
+	if err := s.keystore.StoreChatSecret(context.Background(), record); err != nil {
 		s.log.Warn("persist chat secret", zap.Error(err), zap.String("chat_id", chatID))
 	}
 }
@@ -1060,7 +1066,7 @@ func (s *AppRouterService) eraseSecret(chatID string) {
 	if s.keystore == nil {
 		return
 	}
-	if err := s.keystore.DeleteSecret(context.Background(), chatID); err != nil {
+	if err := s.keystore.DeleteChatSecret(context.Background(), chatID); err != nil {
 		s.log.Warn("erase chat secret", zap.Error(err), zap.String("chat_id", chatID))
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hermes-proxy/hermes-proxy/internal/keystore"
 	"github.com/hermes-proxy/hermes-proxy/internal/registry"
 	"github.com/hermes-proxy/hermes-proxy/pkg/api/approuterpb"
 	"go.uber.org/zap/zaptest"
@@ -196,7 +197,11 @@ func TestIdleChatExpiry(t *testing.T) {
 	tl.lastActivity = time.Now().Add(-time.Minute)
 
 	_ = reg.Register(registry.ChatSession{ChatID: "chat-expire"})
-	if err := ks.StoreSecret(context.Background(), "chat-expire", []byte("secret")); err != nil {
+	if err := ks.StoreChatSecret(context.Background(), keystore.ChatSecretRecord{
+		ChatID:         "chat-expire",
+		KeyVersion:     1,
+		LegacyCombined: []byte("secret"),
+	}); err != nil {
 		t.Fatalf("seed keystore: %v", err)
 	}
 
@@ -397,11 +402,13 @@ func mustRandBytes(t *testing.T, n int) []byte {
 type memoryKeystore struct {
 	mu      sync.Mutex
 	secrets map[string][]byte
+	chats   map[string]keystore.ChatSecretRecord
 }
 
 func newMemoryKeystore() *memoryKeystore {
 	return &memoryKeystore{
 		secrets: make(map[string][]byte),
+		chats:   make(map[string]keystore.ChatSecretRecord),
 	}
 }
 
@@ -432,9 +439,43 @@ func (m *memoryKeystore) DeleteSecret(_ context.Context, keyID string) error {
 	return nil
 }
 
+func (m *memoryKeystore) StoreChatSecret(_ context.Context, record keystore.ChatSecretRecord) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.chats[record.ChatID] = record.Clone()
+	return nil
+}
+
+func (m *memoryKeystore) LoadChatSecret(_ context.Context, chatID string) (keystore.ChatSecretRecord, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rec, ok := m.chats[chatID]
+	if !ok {
+		return keystore.ChatSecretRecord{}, os.ErrNotExist
+	}
+	return rec.Clone(), nil
+}
+
+func (m *memoryKeystore) DeleteChatSecret(_ context.Context, chatID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.chats, chatID)
+	return nil
+}
+
+func (m *memoryKeystore) ListChatSecrets(_ context.Context) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ids := make([]string, 0, len(m.chats))
+	for id := range m.chats {
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
 func (m *memoryKeystore) has(keyID string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	_, ok := m.secrets[keyID]
+	_, ok := m.chats[keyID]
 	return ok
 }

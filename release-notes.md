@@ -1,6 +1,7 @@
 # Release Notes
 
 ## Unreleased
+- 2025-11-26: Upgraded keystore to versioned chat-secret records (HKDF metadata, send/recv/mac/ratchet seeds, zeroization, legacy migration), added X25519/HKDF helper library with deterministic key IDs/vectors, crypto config knobs (hash/info label/max key lifetime) with validation, and wired AppRouter to the new chat-secret API.
 - 2025-11-25: Added Phase 3 (per-chat PFS) plan with iteration prompts, refreshed AGENT guardrails/README/wiki for PFS scope and testing/deployment expectations.
 - 2025-11-24: Hardened integration harness: `make integration` now waits on mock app containers with `docker wait` and fails on missing/failed services; removed obsolete Compose version field to silence CI warnings.
 - 2025-11-24: Added churn/failover handling for NodeMesh: membership `FAIL` events and heartbeat evictions now remove peers, stop gossip/route streams, notify AppRouter to tear down remote chats (`route_unavailable`), and expose new mesh metrics for suspected/evicted peers with fresh unit tests.

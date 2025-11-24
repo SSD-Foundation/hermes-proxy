@@ -22,7 +22,7 @@ Deliver Stage 3 from `docs/hermes-mvp-revised.md` for **nodes only**: enforce pe
 
 ## Current status (Phase 2 complete)
 - Multi-node mesh, target-aware `StartChat`/`RouteChat`, SWIM-style gossip/churn handling, and sealed keystore storage for chat secrets are in place.
-- Chat frames already carry an identity-signed ephemeral public key, but PFS, key derivation, ratcheting, and robust erasure semantics are not yet implemented.
+- Crypto foundations landed: versioned chat-secret records with HKDF metadata/migration, X25519/HKDF helper library, and validated crypto knobs. Protocol wiring, derivation on StartChat/rekey, and ratcheting remain.
 
 ## Workstreams
 - **Protocols & envelopes:** Update `app_router.proto`/`nodemesh.proto` for X25519 key metadata, key versions, rekey/ratchet signals, and deterministic error codes.

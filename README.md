@@ -62,13 +62,23 @@ cleanup:
   sweep_interval: "30s"
   session_idle_timeout: "5m"
   chat_idle_timeout: "10m"
+crypto:
+  hkdf_hash: "sha256"
+  hkdf_info_label: "hermes-chat-session"
+  max_key_lifetime: "24h"
 grpc_server:
   max_recv_msg_size: 4194304
   max_send_msg_size: 4194304
   keepalive_time: "2m"
   keepalive_timeout: "20s"
   max_connection_idle: "0s" # 0 defers to cleanup.session_idle_timeout
+crypto:
+  hkdf_hash: "sha256"              # sha256 or sha512
+  hkdf_info_label: "hermes-chat-session"
+  max_key_lifetime: "24h"          # bounds validated at startup
 ```
+
+Crypto parameters govern the HKDF hash/info label used for per-chat derivation and the maximum key lifetime before rekey; invalid values are rejected at startup.
 
 ## Mesh bootstrap
 - Node identity (ed25519) is stored in the sealed keystore under `mesh.identity_secret` and advertised during `NodeMesh.Join` alongside the node ID, wallet placeholder, and public endpoint.
@@ -90,6 +100,7 @@ grpc_server:
 - `proto/nodemesh.proto`: NodeMesh protobuf contract (Join/Gossip/RouteChat envelopes); generated code in `pkg/api/nodemeshpb`.
 - `internal/config`: Config loader with env overrides and server tuning defaults.
 - `internal/keystore`: Argon2id-derived file backend (sealed storage with tamper detection) with tests.
+- `internal/crypto/pfs`: X25519 helpers (key IDs, shared secret) and HKDF derivation for send/recv/mac/ratchet material with deterministic vectors.
 - `internal/registry`: In-memory chat/tieline registry and app presence map.
 - `internal/mesh`: NodeMesh membership store, gRPC server, and bootstrap dialer.
 - `internal/server`: gRPC server wiring, `AppRouter` implementation (connect handshake, chat routing, teardown, metrics, housekeeping), NodeMesh service, and admin endpoints.

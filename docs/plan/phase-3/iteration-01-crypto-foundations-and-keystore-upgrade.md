@@ -16,4 +16,6 @@ Lock in the cryptographic primitives and storage model for per-chat secrets: sta
 - Config accepts vetted crypto parameters; invalid values are rejected early with clear errors.
 
 ## Status update (2025-11-25)
-- Planned; no implementation started. This iteration defines the record formats, helpers, and keystore upgrades that later iterations will consume.
+- Implemented versioned chat-secret records with HKDF metadata, send/recv/mac/ratchet seeds, zeroization, and sealed storage; legacy combined blobs migrate automatically.
+- Added X25519/HKDF helpers (deterministic key IDs, shared-secret + HKDF derivation with vectors) and crypto config validation (hash/info label/max key lifetime).
+- Ready for protocol wiring and rekey flows in Iteration 02.

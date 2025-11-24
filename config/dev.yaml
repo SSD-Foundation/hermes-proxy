@@ -26,6 +26,10 @@ cleanup:
   sweep_interval: "30s"
   session_idle_timeout: "5m"
   chat_idle_timeout: "10m"
+crypto:
+  hkdf_hash: "sha256"
+  hkdf_info_label: "hermes-chat-session"
+  max_key_lifetime: "24h"
 grpc_server:
   max_recv_msg_size: 4194304
   max_send_msg_size: 4194304

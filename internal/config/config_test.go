@@ -43,6 +43,15 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Mesh.Gossip.HeartbeatInterval != defaultMeshHeartbeat {
 		t.Fatalf("expected default heartbeat %s, got %s", defaultMeshHeartbeat, cfg.Mesh.Gossip.HeartbeatInterval)
 	}
+	if cfg.Crypto.HKDFHash != defaultHKDFHash {
+		t.Fatalf("expected default hkdf hash %s, got %s", defaultHKDFHash, cfg.Crypto.HKDFHash)
+	}
+	if cfg.Crypto.HKDFInfoLabel != defaultHKDFInfoLabel {
+		t.Fatalf("expected default hkdf info label %s, got %s", defaultHKDFInfoLabel, cfg.Crypto.HKDFInfoLabel)
+	}
+	if cfg.Crypto.MaxKeyLifetime != defaultMaxKeyLifetime {
+		t.Fatalf("expected default max key lifetime %s, got %s", defaultMaxKeyLifetime, cfg.Crypto.MaxKeyLifetime)
+	}
 }
 
 func TestLoadWithFileAndEnvOverride(t *testing.T) {
@@ -65,6 +74,10 @@ mesh:
   gossip:
     dial_interval: "1s"
     heartbeat_interval: "2s"
+crypto:
+  hkdf_hash: "sha512"
+  hkdf_info_label: "custom-info"
+  max_key_lifetime: "36h"
 `), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -109,6 +122,15 @@ mesh:
 	if cfg.Mesh.Gossip.HeartbeatInterval != 2*time.Second {
 		t.Fatalf("expected heartbeat interval 2s, got %s", cfg.Mesh.Gossip.HeartbeatInterval)
 	}
+	if cfg.Crypto.HKDFHash != "sha512" {
+		t.Fatalf("expected hkdf hash sha512, got %s", cfg.Crypto.HKDFHash)
+	}
+	if cfg.Crypto.HKDFInfoLabel != "custom-info" {
+		t.Fatalf("expected hkdf info label custom-info, got %s", cfg.Crypto.HKDFInfoLabel)
+	}
+	if cfg.Crypto.MaxKeyLifetime != 36*time.Hour {
+		t.Fatalf("expected max key lifetime 36h, got %s", cfg.Crypto.MaxKeyLifetime)
+	}
 }
 
 func TestPassphraseFetch(t *testing.T) {
@@ -132,5 +154,36 @@ func TestPassphraseFetch(t *testing.T) {
 	cfg.Keystore.PassphraseEnv = "MISSING_ENV"
 	if _, err := cfg.Passphrase(); err == nil {
 		t.Fatal("expected error when passphrase env is missing")
+	}
+}
+
+func TestCryptoValidation(t *testing.T) {
+	if err := validateCryptoConfig(CryptoConfig{
+		HKDFHash:       "md5",
+		HKDFInfoLabel:  "ok",
+		MaxKeyLifetime: time.Hour,
+	}); err == nil {
+		t.Fatal("expected invalid hash error")
+	}
+	if err := validateCryptoConfig(CryptoConfig{
+		HKDFHash:       "sha256",
+		HKDFInfoLabel:  "",
+		MaxKeyLifetime: time.Hour,
+	}); err == nil {
+		t.Fatal("expected info label error")
+	}
+	if err := validateCryptoConfig(CryptoConfig{
+		HKDFHash:       "sha256",
+		HKDFInfoLabel:  "ok",
+		MaxKeyLifetime: 10 * time.Second,
+	}); err == nil {
+		t.Fatal("expected max key lifetime bounds error")
+	}
+	if err := validateCryptoConfig(CryptoConfig{
+		HKDFHash:       "sha256",
+		HKDFInfoLabel:  "ok",
+		MaxKeyLifetime: time.Hour,
+	}); err != nil {
+		t.Fatalf("expected valid crypto config, got %v", err)
 	}
 }
