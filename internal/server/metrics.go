@@ -16,6 +16,7 @@ type routerMetrics struct {
 	ratchetAdvance *prometheus.CounterVec
 	ratchetFailure *prometheus.CounterVec
 	secretErase    *prometheus.CounterVec
+	rekeys         *prometheus.CounterVec
 }
 
 func newRouterMetrics(reg prometheus.Registerer) *routerMetrics {
@@ -61,6 +62,10 @@ func newRouterMetrics(reg prometheus.Registerer) *routerMetrics {
 			Name: "hermes_chat_erasures_total",
 			Help: "Chat secret erasures grouped by reason.",
 		}, []string{"reason"}),
+		rekeys: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "hermes_rekeys_total",
+			Help: "Rekey/resume events grouped by outcome.",
+		}, []string{"result"}),
 	}
 
 	reg.MustRegister(
@@ -73,6 +78,7 @@ func newRouterMetrics(reg prometheus.Registerer) *routerMetrics {
 		m.ratchetAdvance,
 		m.ratchetFailure,
 		m.secretErase,
+		m.rekeys,
 	)
 	return m
 }
@@ -155,4 +161,14 @@ func (m *routerMetrics) recordErasure(reason string) {
 		reason = "unknown"
 	}
 	m.secretErase.WithLabelValues(reason).Inc()
+}
+
+func (m *routerMetrics) recordRekey(result string) {
+	if m == nil {
+		return
+	}
+	if result == "" {
+		result = "unknown"
+	}
+	m.rekeys.WithLabelValues(result).Inc()
 }

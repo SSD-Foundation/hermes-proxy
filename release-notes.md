@@ -1,6 +1,7 @@
 # Release Notes
 
 ## Unreleased
+- 2025-11-28: Added keystore-backed chat resume (restores ratchet counters), enforced rekey flag/version validation with per-chat/app throttling and new config knobs, surfaced `hermes_rekeys_total` + `resumed`/`expired` fields in `/crypto/ratchets`, and taught mockapp to drive rekey attempts.
 - 2025-11-27: Implemented per-message symmetric ratcheting with persisted send/recv counters, teardown on sequence divergence or expired key lifetimes, new Prometheus ratchet/erasure metrics, admin `/crypto/ratchets` dump, and multi-message mockapp/in-process tests to exercise the ratchet flow.
 - 2025-11-26: Wired StartChat/RouteChat to carry key versions + HKDF info/salt and signed X25519 material, deriving and sealing per-chat session keys (local + cross-node) with deterministic replay/mismatch errors; updated mockapp, protos, and component tests to cover the new handshake.
 - 2025-11-26: Upgraded keystore to versioned chat-secret records (HKDF metadata, send/recv/mac/ratchet seeds, zeroization, legacy migration), added X25519/HKDF helper library with deterministic key IDs/vectors, crypto config knobs (hash/info label/max key lifetime) with validation, and wired AppRouter to the new chat-secret API.

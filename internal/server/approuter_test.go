@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto"
 	"crypto/ed25519"
 	"crypto/rand"
 	"net"
@@ -362,6 +363,109 @@ func TestRatchetDivergenceTeardown(t *testing.T) {
 	}
 }
 
+func TestResumeChatFromKeystore(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	t.Cleanup(cancel)
+
+	ks := newMemoryKeystore()
+
+	app1Pub, app1Priv := mustKeypair(t)
+	app2Pub, app2Priv := mustKeypair(t)
+	eph1 := mustEphemeral(t)
+	eph2 := mustEphemeral(t)
+
+	chatID := "resume-chat"
+	initialSend := uint64(2)
+	initialRecv := uint64(1)
+	seedResumeRecord(t, ks, chatID, app1Pub, app2Pub, eph1, eph2, initialSend, initialRecv)
+
+	addr, stop, _, _ := startTestRouter(t, ks)
+	t.Cleanup(stop)
+
+	conn1 := dialClient(t, ctx, addr)
+	t.Cleanup(func() { conn1.Close() })
+	conn2 := dialClient(t, ctx, addr)
+	t.Cleanup(func() { conn2.Close() })
+
+	client1 := approuterpb.NewAppRouterClient(conn1)
+	client2 := approuterpb.NewAppRouterClient(conn2)
+
+	stream1, err := client1.Open(ctx)
+	if err != nil {
+		t.Fatalf("open stream1: %v", err)
+	}
+	stream2, err := client2.Open(ctx)
+	if err != nil {
+		t.Fatalf("open stream2: %v", err)
+	}
+
+	sendConnectFrame(t, stream1, "node-1", app1Pub, app1Priv, nil)
+	sendConnectFrame(t, stream2, "node-1", app2Pub, app2Priv, nil)
+	expectConnectAck(t, stream1)
+	expectConnectAck(t, stream2)
+
+	sendStartChat(t, stream1, chatID, appIdentityKey(app2Pub), eph1, app1Priv)
+	expectStartChatAck(t, stream1, chatID)
+	sendStartChat(t, stream2, chatID, appIdentityKey(app1Pub), eph2, app2Priv)
+	expectStartChatAck(t, stream2, chatID)
+
+	_ = waitForStartChat(t, stream1)
+	_ = waitForStartChat(t, stream2)
+
+	app1ID := appIdentityKey(app1Pub)
+	app2ID := appIdentityKey(app2Pub)
+	next1 := initialRecv + 1
+	next2 := initialSend + 1
+	if app1ID < app2ID {
+		next1 = initialSend + 1
+		next2 = initialRecv + 1
+	}
+
+	payload := []byte("resume-payload-1")
+	if err := stream1.Send(&approuterpb.AppFrame{
+		Body: &approuterpb.AppFrame_ChatMessage{
+			ChatMessage: &approuterpb.ChatMessage{
+				ChatId:   chatID,
+				Payload:  payload,
+				Sequence: next1,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("send chat seq %d: %v", next1, err)
+	}
+	expectChatAck(t, stream1, chatID, next1)
+	received1 := waitForChatMessage(t, stream2)
+	if received1.Sequence != next1 {
+		t.Fatalf("expected resume seq %d for app2, got %d", next1, received1.Sequence)
+	}
+
+	payload2 := []byte("resume-payload-2")
+	if err := stream2.Send(&approuterpb.AppFrame{
+		Body: &approuterpb.AppFrame_ChatMessage{
+			ChatMessage: &approuterpb.ChatMessage{
+				ChatId:   chatID,
+				Payload:  payload2,
+				Sequence: next2,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("send chat seq %d: %v", next2, err)
+	}
+	expectChatAck(t, stream2, chatID, next2)
+	received2 := waitForChatMessage(t, stream1)
+	if received2.Sequence != next2 {
+		t.Fatalf("expected resume seq %d for app1, got %d", next2, received2.Sequence)
+	}
+
+	final, err := ks.LoadChatSecret(context.Background(), chatID)
+	if err != nil {
+		t.Fatalf("load resumed secret: %v", err)
+	}
+	if final.SendCount != initialSend+1 || final.RecvCount != initialRecv+1 {
+		t.Fatalf("unexpected ratchet counts after resume: send=%d recv=%d", final.SendCount, final.RecvCount)
+	}
+}
+
 func TestStartChatSignatureFailure(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	t.Cleanup(cancel)
@@ -525,7 +629,7 @@ func TestIdleChatExpiry(t *testing.T) {
 	expectExpired(session2.sendCh)
 }
 
-func startTestRouter(t *testing.T) (addr string, stop func(), reg registry.ChatRegistry, ks *memoryKeystore) {
+func startTestRouter(t *testing.T, stores ...*memoryKeystore) (addr string, stop func(), reg registry.ChatRegistry, ks *memoryKeystore) {
 	t.Helper()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -534,7 +638,11 @@ func startTestRouter(t *testing.T) (addr string, stop func(), reg registry.ChatR
 	}
 
 	reg = registry.NewInMemory(0)
-	ks = newMemoryKeystore()
+	if len(stores) > 0 && stores[0] != nil {
+		ks = stores[0]
+	} else {
+		ks = newMemoryKeystore()
+	}
 	srv := grpc.NewServer()
 	approuterpb.RegisterAppRouterServer(srv, NewAppRouterService(zaptest.NewLogger(t), reg, ks, RouterOptions{}))
 
@@ -709,6 +817,64 @@ func mustEphemeral(t *testing.T) pfs.KeyPair {
 		t.Fatalf("generate x25519 key: %v", err)
 	}
 	return key
+}
+
+func seedResumeRecord(t *testing.T, ks *memoryKeystore, chatID string, app1, app2 ed25519.PublicKey, eph1, eph2 pfs.KeyPair, sendCount, recvCount uint64) {
+	t.Helper()
+
+	hkdfInfo := "hermes-chat-session"
+	app1ID := appIdentityKey(app1)
+	app2ID := appIdentityKey(app2)
+
+	localPair, remotePair := eph1, eph2
+	localAppID, remoteAppID := app1ID, app2ID
+	if app2ID < app1ID {
+		localPair, remotePair = eph2, eph1
+		localAppID, remoteAppID = app2ID, app1ID
+	}
+
+	shared, err := pfs.SharedSecret(localPair.Private, remotePair.Public)
+	if err != nil {
+		t.Fatalf("derive shared secret: %v", err)
+	}
+	keys, err := pfs.DeriveSessionKeys(shared, nil, []byte(hkdfInfo), crypto.SHA256, pfs.SessionKeySizes{})
+	if err != nil {
+		t.Fatalf("derive session keys: %v", err)
+	}
+	defer keys.Zero()
+
+	localKeyID, err := pfs.KeyIdentifier(localPair.Public)
+	if err != nil {
+		t.Fatalf("local key id: %v", err)
+	}
+	remoteKeyID, err := pfs.KeyIdentifier(remotePair.Public)
+	if err != nil {
+		t.Fatalf("remote key id: %v", err)
+	}
+
+	record := keystore.ChatSecretRecord{
+		Version:      1,
+		ChatID:       chatID,
+		KeyVersion:   1,
+		LocalKeyID:   localKeyID,
+		RemoteKeyID:  remoteKeyID,
+		LocalPublic:  append([]byte(nil), localPair.Public...),
+		RemotePublic: append([]byte(nil), remotePair.Public...),
+		LocalPrivate: append([]byte(nil), localPair.Private...),
+		LocalAppID:   localAppID,
+		RemoteAppID:  remoteAppID,
+		HKDFInfo:     []byte(hkdfInfo),
+		SendKey:      append([]byte(nil), keys.SendKey...),
+		RecvKey:      append([]byte(nil), keys.RecvKey...),
+		MACKey:       append([]byte(nil), keys.MACKey...),
+		RatchetSeed:  append([]byte(nil), keys.RatchetKey...),
+		SendCount:    sendCount,
+		RecvCount:    recvCount,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := ks.StoreChatSecret(context.Background(), record); err != nil {
+		t.Fatalf("seed chat secret: %v", err)
+	}
 }
 
 type memoryKeystore struct {

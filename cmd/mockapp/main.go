@@ -32,6 +32,8 @@ type appConfig struct {
 	identitySeed string
 	peerSeed     string
 	messages     int
+	keyVersion   uint32
+	rekey        bool
 }
 
 func main() {
@@ -48,6 +50,7 @@ func parseConfig() appConfig {
 	var identitySeed string
 	var peerSeed string
 	var messages int
+	var keyVersion int
 	flag.StringVar(&cfg.nodeAddr, "node", "127.0.0.1:50051", "gRPC address for the node")
 	flag.StringVar(&cfg.nodeID, "node-id", "hermes-dev", "Node ID used in Connect signatures")
 	flag.StringVar(&cfg.chatID, "chat-id", "integration-chat", "Chat identifier to join")
@@ -57,6 +60,8 @@ func parseConfig() appConfig {
 	flag.StringVar(&peerSeed, "peer-seed", "", "Optional seed for peer identity when target-app is empty")
 	flag.StringVar(&payload, "payload", "integration-payload-012345", "Ciphertext payload to relay")
 	flag.IntVar(&messages, "messages", 2, "Number of messages to send before teardown (sender only)")
+	flag.IntVar(&keyVersion, "key-version", 1, "Key version to advertise on StartChat")
+	flag.BoolVar(&cfg.rekey, "rekey", false, "Mark StartChat as a rekey attempt (requires higher key version)")
 	flag.DurationVar(&cfg.timeout, "timeout", 30*time.Second, "Overall timeout for the chat flow")
 	flag.Parse()
 
@@ -72,6 +77,13 @@ func parseConfig() appConfig {
 		messages = 1
 	}
 	cfg.messages = messages
+	if keyVersion <= 0 {
+		keyVersion = 1
+	}
+	if cfg.rekey && keyVersion == 1 {
+		keyVersion = 2
+	}
+	cfg.keyVersion = uint32(keyVersion)
 
 	if cfg.target == "" {
 		if cfg.identitySeed == "" {
@@ -128,7 +140,7 @@ func run(cfg appConfig) error {
 	if err != nil {
 		return fmt.Errorf("ephemeral key: %w", err)
 	}
-	if err := sendStartChat(stream, cfg.chatID, cfg.target, eph, priv); err != nil {
+	if err := sendStartChat(stream, cfg.chatID, cfg.target, eph, priv, cfg.keyVersion, cfg.rekey); err != nil {
 		return err
 	}
 
@@ -246,10 +258,13 @@ func expectConnectAck(stream approuterpb.AppRouter_OpenClient) error {
 	return nil
 }
 
-func sendStartChat(stream approuterpb.AppRouter_OpenClient, chatID, target string, eph pfs.KeyPair, priv ed25519.PrivateKey) error {
+func sendStartChat(stream approuterpb.AppRouter_OpenClient, chatID, target string, eph pfs.KeyPair, priv ed25519.PrivateKey, keyVersion uint32, rekey bool) error {
 	appID := hex.EncodeToString(priv.Public().(ed25519.PublicKey))
 	info := "hermes-chat-session"
-	payload := startPayload(chatID, appID, target, eph.Public, nil, info, 1, false)
+	if keyVersion == 0 {
+		keyVersion = 1
+	}
+	payload := startPayload(chatID, appID, target, eph.Public, nil, info, keyVersion, rekey)
 	sig := ed25519.Sign(priv, payload)
 	return stream.Send(&approuterpb.AppFrame{
 		Body: &approuterpb.AppFrame_StartChat{
@@ -259,8 +274,9 @@ func sendStartChat(stream approuterpb.AppRouter_OpenClient, chatID, target strin
 				LocalEphemeralPublicKey:  eph.Public,
 				LocalEphemeralPrivateKey: eph.Private,
 				Signature:                sig,
-				KeyVersion:               1,
+				KeyVersion:               keyVersion,
 				HkdfInfo:                 info,
+				Rekey:                    rekey,
 			},
 		},
 	})

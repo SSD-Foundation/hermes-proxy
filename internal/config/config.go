@@ -75,9 +75,11 @@ type CleanupConfig struct {
 
 // CryptoConfig tunes HKDF parameters for per-chat key derivation.
 type CryptoConfig struct {
-	HKDFHash       string        `mapstructure:"hkdf_hash"`
-	HKDFInfoLabel  string        `mapstructure:"hkdf_info_label"`
-	MaxKeyLifetime time.Duration `mapstructure:"max_key_lifetime"`
+	HKDFHash         string        `mapstructure:"hkdf_hash"`
+	HKDFInfoLabel    string        `mapstructure:"hkdf_info_label"`
+	MaxKeyLifetime   time.Duration `mapstructure:"max_key_lifetime"`
+	RekeyInterval    time.Duration `mapstructure:"rekey_interval"`
+	MaxRekeysPerChat int           `mapstructure:"max_rekeys_per_chat"`
 }
 
 // GRPCServer tunes keep-alives and message limits.
@@ -113,6 +115,8 @@ const (
 	defaultHKDFHash            = "sha256"
 	defaultHKDFInfoLabel       = "hermes-chat-session"
 	defaultMaxKeyLifetime      = 24 * time.Hour
+	defaultRekeyInterval       = 30 * time.Second
+	defaultMaxRekeysPerChat    = 3
 	minKeyLifetime             = time.Minute
 	maxKeyLifetime             = 7 * 24 * time.Hour
 )
@@ -148,6 +152,8 @@ func Load(path string) (Config, error) {
 	v.SetDefault("crypto.hkdf_hash", defaultHKDFHash)
 	v.SetDefault("crypto.hkdf_info_label", defaultHKDFInfoLabel)
 	v.SetDefault("crypto.max_key_lifetime", defaultMaxKeyLifetime.String())
+	v.SetDefault("crypto.rekey_interval", defaultRekeyInterval.String())
+	v.SetDefault("crypto.max_rekeys_per_chat", defaultMaxRekeysPerChat)
 
 	if path != "" {
 		v.SetConfigFile(path)
@@ -188,6 +194,9 @@ func Load(path string) (Config, error) {
 		return Config{}, err
 	}
 	if cfg.Crypto.MaxKeyLifetime, err = durationFromConfig(v, "crypto.max_key_lifetime", defaultMaxKeyLifetime); err != nil {
+		return Config{}, err
+	}
+	if cfg.Crypto.RekeyInterval, err = durationFromConfig(v, "crypto.rekey_interval", defaultRekeyInterval); err != nil {
 		return Config{}, err
 	}
 	if cfg.Mesh.Gossip.DialInterval, err = durationFromConfig(v, "mesh.gossip.dial_interval", defaultMeshDialInterval); err != nil {
@@ -243,6 +252,12 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.Crypto.MaxKeyLifetime == 0 {
 		cfg.Crypto.MaxKeyLifetime = defaultMaxKeyLifetime
+	}
+	if cfg.Crypto.RekeyInterval == 0 {
+		cfg.Crypto.RekeyInterval = defaultRekeyInterval
+	}
+	if cfg.Crypto.MaxRekeysPerChat == 0 {
+		cfg.Crypto.MaxRekeysPerChat = defaultMaxRekeysPerChat
 	}
 	if cfg.Keystore.PassphraseEnv == "" {
 		cfg.Keystore.PassphraseEnv = defaultPassphraseEnv
@@ -301,6 +316,12 @@ func validateCryptoConfig(c CryptoConfig) error {
 	}
 	if len(c.HKDFInfoLabel) > 128 {
 		return fmt.Errorf("crypto.hkdf_info_label exceeds 128 characters")
+	}
+	if c.RekeyInterval <= 0 {
+		return fmt.Errorf("crypto.rekey_interval must be positive")
+	}
+	if c.MaxRekeysPerChat <= 0 {
+		return fmt.Errorf("crypto.max_rekeys_per_chat must be positive")
 	}
 	return nil
 }

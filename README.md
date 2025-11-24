@@ -66,6 +66,8 @@ crypto:
   hkdf_hash: "sha256"
   hkdf_info_label: "hermes-chat-session"
   max_key_lifetime: "24h"
+  rekey_interval: "30s"
+  max_rekeys_per_chat: 3
 grpc_server:
   max_recv_msg_size: 4194304
   max_send_msg_size: 4194304
@@ -76,9 +78,11 @@ crypto:
   hkdf_hash: "sha256"              # sha256 or sha512
   hkdf_info_label: "hermes-chat-session"
   max_key_lifetime: "24h"          # bounds validated at startup
+  rekey_interval: "30s"            # rate-limit window for rekey attempts
+  max_rekeys_per_chat: 3           # attempts per chat/app before REKEY_THROTTLED
 ```
 
-Crypto parameters govern the HKDF hash/info label used for per-chat derivation and the maximum key lifetime before rekey; invalid values are rejected at startup.
+Crypto parameters govern the HKDF hash/info label used for per-chat derivation, the maximum key lifetime before rekey, and the rekey throttle window; invalid values are rejected at startup.
 
 ## Mesh bootstrap
 - Node identity (ed25519) is stored in the sealed keystore under `mesh.identity_secret` and advertised during `NodeMesh.Join` alongside the node ID, wallet placeholder, and public endpoint.
@@ -116,6 +120,7 @@ Crypto parameters govern the HKDF hash/info label used for per-chat derivation a
 - Connect: app sends `Connect` with ed25519 identity pubkey and signature over node ID + metadata; node replies with `ConnectAck`, registers the session, and syncs app presence into the routing table.
 - StartChat: each peer sends `StartChat` with `chat_id`, `target_app_id` (optional `target_node_hint`), and a signed ephemeral pubkey. The node resolves the target via the routing table (local registry + mesh AppSync) and opens/joins a `RouteChat` tieline if the target lives on another node. `StartChatAck` is sent once accepted; the peer’s ephemeral key is delivered via a server-initiated `StartChat` frame once both keys are present. `FindApp` frames return the hosting node for a target app identity.
 - SendChatMessage: AEAD ciphertext envelopes are relayed locally or over `RouteChat`; per-sender sequence numbers must be monotonic and drive symmetric ratchets. Ratchet state (send/recv counters) is sealed in the keystore and advanced on each message; divergence returns `RATCHET_DESYNC` + `DeleteChatAck` with `ratchet_desync` and erases secrets locally/remote. Keys that exceed `crypto.max_key_lifetime` trigger `rekey_required` teardowns. `ChatMessageAck` is emitted after the remote hop ACKs to preserve end-to-end backpressure across nodes.
+- Rekey/resume: rekey attempts must set `rekey=true` with an incremented `key_version`; duplicate/stale attempts return `REPLAYED_KEY` and rekeys are rate-limited per chat/app (`REKEY_THROTTLED`). On node restart or chat resume, sealed ratchet state (keys + send/recv counters) is loaded from the keystore so the next expected sequence is enforced. Prometheus exposes `hermes_rekeys_total{result=…}` and `/crypto/ratchets` now reports `resumed`/`expired` flags alongside key versions.
 - DeleteChat: caller triggers teardown and key erasure; both peers receive `DeleteChatAck` (`deleted` / `deleted_by_peer`). Route loss or remote teardown returns `DeleteChatAck` with `route_closed`/`route_unavailable` as appropriate. Ratchet failures/expiry return `ratchet_desync`/`rekey_required`.
 - Housekeeping: idle chats are expired by the server (`cleanup.chat_idle_timeout`), propagate a remote teardown, and return `DeleteChatAck` with `expired`; per-chat secrets and ephemeral keys are wiped from memory and the keystore.
 - Heartbeat: echoed to keep the stream warm and track liveness.

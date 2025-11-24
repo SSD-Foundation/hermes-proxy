@@ -109,6 +109,8 @@ func (s *NodeServer) Start(ctx context.Context) error {
 		HKDFHash:             s.cfg.Crypto.HKDFHash,
 		HKDFInfo:             s.cfg.Crypto.HKDFInfoLabel,
 		MaxKeyLifetime:       s.cfg.Crypto.MaxKeyLifetime,
+		MaxRekeysPerChat:     s.cfg.Crypto.MaxRekeysPerChat,
+		RekeyInterval:        s.cfg.Crypto.RekeyInterval,
 	})
 	s.router = router
 

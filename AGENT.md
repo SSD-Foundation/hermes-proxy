@@ -36,7 +36,7 @@ This file defines the mandatory operating rules for contributors and automation.
 - Any change to tooling, images, orchestration, trust bundles, or environment variables must update this section and the supporting files.
 
 ## Security and key management
-- Keystore uses Argon2id-derived master key; enforce sealed storage and tamper detection. On DeleteChat, rekey/ratchet teardown, expiry, or churn cleanup, erase per-chat secrets from memory and disk on all affected nodes.
+- Keystore uses Argon2id-derived master key; enforce sealed storage and tamper detection. Persisted ratchet state (keys + send/recv counters) must be reloaded on resume; rekey attempts must bump key versions and are throttled per chat/app with deterministic errors. On DeleteChat, rekey/ratchet teardown, expiry, or churn cleanup, erase per-chat secrets from memory and disk on all affected nodes.
 - PFS primitives: identity keys remain Ed25519; per-chat keys use X25519 with HKDF-derived send/recv/mac/ratchet material and versioning. Reject unsigned or replayed key material; throttle retries.
 - TLS is required for node↔node; prefer TLS (or mTLS) for app↔node when hardening lands. Validate peer identity keys before allocating state; reject malformed frames deterministically.
 - Never log private keys or ciphertexts. Redact identifiers where necessary.

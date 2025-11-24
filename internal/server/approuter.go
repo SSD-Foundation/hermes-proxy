@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -43,6 +44,16 @@ var (
 	errKeyExpired      = errors.New("chat key lifetime exceeded")
 )
 
+type rekeyWindow struct {
+	count int
+	reset time.Time
+}
+
+type rekeyKey struct {
+	chatID string
+	appID  string
+}
+
 type ratchetDirection string
 
 const (
@@ -63,25 +74,30 @@ type RouterOptions struct {
 	HKDFHash             string
 	HKDFInfo             string
 	MaxKeyLifetime       time.Duration
+	MaxRekeysPerChat     int
+	RekeyInterval        time.Duration
 }
 
 // AppRouterService implements the gRPC AppRouter contract.
 type AppRouterService struct {
 	approuterpb.UnimplementedAppRouterServer
-	log       *zap.Logger
-	registry  registry.ChatRegistry
-	keystore  keystore.KeyBackend
-	metrics   *routerMetrics
-	mu        sync.Mutex
-	sessions  map[string]*appSession
-	byAppID   map[string]*appSession
-	chats     map[string]*tieline
-	houseOnce sync.Once
+	log           *zap.Logger
+	registry      registry.ChatRegistry
+	keystore      keystore.KeyBackend
+	metrics       *routerMetrics
+	mu            sync.Mutex
+	sessions      map[string]*appSession
+	byAppID       map[string]*appSession
+	chats         map[string]*tieline
+	rekeyAttempts map[rekeyKey]rekeyWindow
+	houseOnce     sync.Once
 
 	nodeID         string
 	hkdfHash       crypto.Hash
 	hkdfInfo       string
 	maxKeyLifetime time.Duration
+	rekeyLimit     int
+	rekeyWindow    time.Duration
 	apps           registry.AppRegistry
 	store          *mesh.Store
 	routes         *mesh.RouteClientPool
@@ -111,6 +127,14 @@ func NewAppRouterService(log *zap.Logger, reg registry.ChatRegistry, ks keystore
 	if maxLifetime <= 0 {
 		maxLifetime = 24 * time.Hour
 	}
+	rekeyLimit := opts.MaxRekeysPerChat
+	if rekeyLimit <= 0 {
+		rekeyLimit = 3
+	}
+	rekeyWindowDur := opts.RekeyInterval
+	if rekeyWindowDur <= 0 {
+		rekeyWindowDur = time.Minute
+	}
 	svc := &AppRouterService{
 		log:                  log,
 		registry:             reg,
@@ -119,6 +143,7 @@ func NewAppRouterService(log *zap.Logger, reg registry.ChatRegistry, ks keystore
 		sessions:             make(map[string]*appSession),
 		byAppID:              make(map[string]*appSession),
 		chats:                make(map[string]*tieline),
+		rekeyAttempts:        make(map[rekeyKey]rekeyWindow),
 		sessionIdleTimeout:   opts.SessionIdleTimeout,
 		chatIdleTimeout:      opts.ChatIdleTimeout,
 		housekeepingInterval: opts.HousekeepingInterval,
@@ -126,6 +151,8 @@ func NewAppRouterService(log *zap.Logger, reg registry.ChatRegistry, ks keystore
 		hkdfHash:             hash,
 		hkdfInfo:             info,
 		maxKeyLifetime:       maxLifetime,
+		rekeyLimit:           rekeyLimit,
+		rekeyWindow:          rekeyWindowDur,
 		apps:                 opts.Apps,
 		store:                opts.MeshStore,
 		routes:               opts.Routes,
@@ -313,6 +340,11 @@ func (s *AppRouterService) handleStartChat(session *appSession, start *approuter
 		return err
 	}
 
+	resumeRec, err := s.loadChatSecret(start.ChatId)
+	if err != nil {
+		return &routeError{code: "DERIVATION_FAILED", msg: fmt.Sprintf("load chat secret: %v", err)}
+	}
+
 	routeNode, localRoute, err := s.resolveRoute(start.TargetAppId, start.TargetNodeHint)
 	if err != nil {
 		return &routeError{code: "TARGET_NOT_FOUND", msg: err.Error()}
@@ -352,12 +384,38 @@ func (s *AppRouterService) handleStartChat(session *appSession, start *approuter
 	if tl.metadata == nil && len(start.Metadata) > 0 {
 		tl.metadata = cloneMetadata(start.Metadata)
 	}
+	if tl.secret == nil && resumeRec != nil {
+		tl.applyResume(*resumeRec)
+		s.recordRekey("resume")
+	}
+
+	prevVersion := tl.keyVersion
+	if start.Rekey {
+		if prevVersion > 0 && start.KeyVersion <= prevVersion {
+			s.recordRekey("stale")
+			s.mu.Unlock()
+			return &routeError{code: "REPLAYED_KEY", msg: "rekey version must increase"}
+		}
+		if !s.allowRekeyLocked(start.ChatId, session.appID, now) {
+			s.recordRekey("throttled")
+			s.mu.Unlock()
+			return &routeError{code: "REKEY_THROTTLED", msg: "rekey attempts exceeded"}
+		}
+		s.recordRekey("attempt")
+	}
+	if prevVersion > 0 && start.KeyVersion > prevVersion && !start.Rekey {
+		s.mu.Unlock()
+		return &routeError{code: "INVALID_FRAME", msg: "rekey flag required for version bump"}
+	}
 
 	if err := tl.prepareVersion(participant.keys.keyVersion, participant.keys.hkdfInfo, participant.keys.hkdfSalt); err != nil {
 		s.mu.Unlock()
 		code := "KEY_MISMATCH"
 		if errors.Is(err, errStaleKeyVersion) {
 			code = "REPLAYED_KEY"
+		}
+		if start.Rekey {
+			s.recordRekey(code)
 		}
 		return &routeError{code: code, msg: err.Error()}
 	}
@@ -369,7 +427,16 @@ func (s *AppRouterService) handleStartChat(session *appSession, start *approuter
 		} else if errors.Is(err, errHKDFMismatch) {
 			code = "KEY_MISMATCH"
 		}
+		if start.Rekey {
+			s.recordRekey(code)
+		}
 		return &routeError{code: code, msg: err.Error()}
+	}
+	if seq := tl.resumeSequence(participant.appID); seq > 0 {
+		participant.nextSeq = seq
+	}
+	if start.Rekey && start.KeyVersion > prevVersion {
+		s.recordRekey("accepted")
 	}
 	tl.markActive()
 
@@ -407,6 +474,9 @@ func (s *AppRouterService) handleStartChat(session *appSession, start *approuter
 			if tl.remote.nodeID == "" {
 				tl.remote.nodeID = routeNode
 			}
+		}
+		if seq := tl.resumeSequence(tl.remote.appID); seq > 0 {
+			tl.remote.inboundSeq = seq
 		}
 		remoteReady = tl.readyRemote()
 	}
@@ -737,6 +807,7 @@ func (s *AppRouterService) handleDeleteChat(session *appSession, del *approuterp
 		}
 		delete(s.chats, del.ChatId)
 		tl.wipeSecrets()
+		s.resetRekeyLocked(del.ChatId)
 		removed = true
 	}
 	s.mu.Unlock()
@@ -839,6 +910,11 @@ func (s *AppRouterService) handleRouteSetup(fromNode string, setup *nodemeshpb.S
 		return nil, &mesh.RouteError{Code: "TARGET_NOT_FOUND", Msg: "target app not connected"}
 	}
 
+	resumeRec, err := s.loadChatSecret(setup.ChatId)
+	if err != nil {
+		return nil, &mesh.RouteError{Code: "DERIVATION_FAILED", Msg: fmt.Sprintf("load chat secret: %v", err)}
+	}
+
 	now := time.Now()
 	s.mu.Lock()
 	tl, ok := s.chats[setup.ChatId]
@@ -853,11 +929,37 @@ func (s *AppRouterService) handleRouteSetup(fromNode string, setup *nodemeshpb.S
 		})
 		s.incChat()
 	}
+	if tl.secret == nil && resumeRec != nil {
+		tl.applyResume(*resumeRec)
+		s.recordRekey("resume")
+	}
+
+	prevVersion := tl.keyVersion
+	if setup.Rekey {
+		if prevVersion > 0 && setup.KeyVersion <= prevVersion {
+			s.recordRekey("stale")
+			s.mu.Unlock()
+			return nil, &mesh.RouteError{Code: "REPLAYED_KEY", Msg: "rekey version must increase"}
+		}
+		if !s.allowRekeyLocked(setup.ChatId, sourceID, now) {
+			s.recordRekey("throttled")
+			s.mu.Unlock()
+			return nil, &mesh.RouteError{Code: "REKEY_THROTTLED", Msg: "rekey attempts exceeded"}
+		}
+		s.recordRekey("attempt")
+	}
+	if prevVersion > 0 && setup.KeyVersion > prevVersion && !setup.Rekey {
+		s.mu.Unlock()
+		return nil, &mesh.RouteError{Code: "INVALID_FRAME", Msg: "rekey flag required for version bump"}
+	}
 	if err := tl.prepareVersion(setup.KeyVersion, setup.HkdfInfo, setup.HkdfSalt); err != nil {
 		s.mu.Unlock()
 		code := "KEY_MISMATCH"
 		if errors.Is(err, errStaleKeyVersion) {
 			code = "REPLAYED_KEY"
+		}
+		if setup.Rekey {
+			s.recordRekey(code)
 		}
 		return nil, &mesh.RouteError{Code: code, Msg: err.Error()}
 	}
@@ -880,6 +982,12 @@ func (s *AppRouterService) handleRouteSetup(fromNode string, setup *nodemeshpb.S
 	tl.remote.hkdfInfo = setup.HkdfInfo
 	tl.remote.rekey = setup.Rekey
 	tl.remote.startNotified = false
+	if seq := tl.resumeSequence(tl.remote.appID); seq > 0 {
+		tl.remote.inboundSeq = seq
+	}
+	if setup.Rekey && setup.KeyVersion > prevVersion {
+		s.recordRekey("accepted")
+	}
 	tl.markActive()
 	s.mu.Unlock()
 
@@ -1013,6 +1121,7 @@ func (s *AppRouterService) handleRouteTeardown(teardown *nodemeshpb.TeardownTiel
 		}
 		delete(s.chats, teardown.ChatId)
 		tl.wipeSecrets()
+		s.resetRekeyLocked(teardown.ChatId)
 		removed = true
 	}
 	s.mu.Unlock()
@@ -1059,6 +1168,7 @@ func (s *AppRouterService) handleRouteError(chatID string, rerr *nodemeshpb.Rout
 		}
 		delete(s.chats, chatID)
 		tl.wipeSecrets()
+		s.resetRekeyLocked(chatID)
 		removed = true
 	}
 	s.mu.Unlock()
@@ -1096,6 +1206,7 @@ func (s *AppRouterService) handleNodeLoss(nodeID, reason string) {
 			}
 			tl.wipeSecrets()
 			delete(s.chats, chatID)
+			s.resetRekeyLocked(chatID)
 			chats = append(chats, removed{id: chatID, sessions: participants})
 		}
 	}
@@ -1208,6 +1319,7 @@ func (s *AppRouterService) cleanupSession(session *appSession) {
 				if tl.remote != nil {
 					remoteNode = tl.remote.nodeID
 				}
+				s.resetRekeyLocked(chatID)
 				deletedChats = append(deletedChats, removed{id: chatID, remoteNode: remoteNode})
 			}
 		}
@@ -1234,6 +1346,26 @@ func (s *AppRouterService) cleanupSession(session *appSession) {
 	s.log.Info("app disconnected", zap.String("session_id", session.id))
 }
 
+func (s *AppRouterService) loadChatSecret(chatID string) (*keystore.ChatSecretRecord, error) {
+	if s.keystore == nil || chatID == "" {
+		return nil, nil
+	}
+	rec, err := s.keystore.LoadChatSecret(context.Background(), chatID)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if rec.KeyVersion == 0 {
+		rec.KeyVersion = 1
+	}
+	if len(rec.LocalPrivate) != pfs.KeySize || len(rec.LocalPublic) != pfs.KeySize || len(rec.RemotePublic) != pfs.KeySize {
+		return nil, fmt.Errorf("stored chat secret incomplete")
+	}
+	return &rec, nil
+}
+
 func (s *AppRouterService) tryDeriveChatSecret(chatID string) error {
 	material, ready, err := s.derivationMaterial(chatID)
 	if err != nil {
@@ -1248,10 +1380,15 @@ func (s *AppRouterService) tryDeriveChatSecret(chatID string) error {
 		return err
 	}
 
+	if material.keyVersion > 1 {
+		s.recordRekey("applied")
+	}
+
 	s.mu.Lock()
 	if tl, ok := s.chats[chatID]; ok {
 		tl.derivedVersion = material.keyVersion
 	}
+	s.resetRekeyLocked(chatID)
 	s.mu.Unlock()
 	return nil
 }
@@ -1350,6 +1487,23 @@ func (s *AppRouterService) cacheRatchetState(chatID string, record keystore.Chat
 	tl.ratchetLocalID = record.LocalAppID
 	tl.ratchetRemoteID = record.RemoteAppID
 	tl.lastRatchet = record.CreatedAt
+	if !record.RotatedAt.IsZero() {
+		tl.lastRatchet = record.RotatedAt
+	}
+	if tl.resumeSeq == nil {
+		tl.resumeSeq = make(map[string]uint64)
+	} else {
+		for k := range tl.resumeSeq {
+			delete(tl.resumeSeq, k)
+		}
+	}
+	if record.LocalAppID != "" {
+		tl.resumeSeq[record.LocalAppID] = record.SendCount
+	}
+	if record.RemoteAppID != "" {
+		tl.resumeSeq[record.RemoteAppID] = record.RecvCount
+	}
+	tl.resumed = false
 }
 
 func (s *AppRouterService) eraseSecret(chatID string) {
@@ -1376,6 +1530,7 @@ func (s *AppRouterService) teardownOnFailure(chatID string, deriveErr error) {
 		}
 		tl.wipeSecrets()
 		delete(s.chats, chatID)
+		s.resetRekeyLocked(chatID)
 		removed = true
 	}
 	s.mu.Unlock()
@@ -1461,6 +1616,7 @@ func (s *AppRouterService) handleRatchetDivergence(chatID, status string) {
 		}
 		tl.wipeSecrets()
 		delete(s.chats, chatID)
+		s.resetRekeyLocked(chatID)
 		removed = true
 	}
 	s.mu.Unlock()
@@ -1510,6 +1666,7 @@ func (s *AppRouterService) expireIdleChats(now time.Time) {
 				sessions = append(sessions, p.session)
 			}
 			delete(s.chats, chatID)
+			s.resetRekeyLocked(chatID)
 			nodeID := ""
 			if tl.remote != nil {
 				nodeID = tl.remote.nodeID
@@ -1605,6 +1762,53 @@ func (s *AppRouterService) recordErasure(reason string) {
 	s.metrics.recordErasure(reason)
 }
 
+func (s *AppRouterService) recordRekey(result string) {
+	if s.metrics == nil {
+		return
+	}
+	s.metrics.recordRekey(result)
+}
+
+// allowRekeyLocked enforces per-chat/app rate limits for rekey attempts.
+// Caller must hold s.mu.
+func (s *AppRouterService) allowRekeyLocked(chatID, appID string, now time.Time) bool {
+	if s.rekeyLimit <= 0 {
+		return true
+	}
+	if s.rekeyAttempts == nil {
+		s.rekeyAttempts = make(map[rekeyKey]rekeyWindow)
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+
+	key := rekeyKey{chatID: chatID, appID: appID}
+	window := s.rekeyAttempts[key]
+	if window.reset.IsZero() || now.After(window.reset) {
+		s.rekeyAttempts[key] = rekeyWindow{count: 1, reset: now.Add(s.rekeyWindow)}
+		return true
+	}
+	if window.count >= s.rekeyLimit {
+		return false
+	}
+	window.count++
+	s.rekeyAttempts[key] = window
+	return true
+}
+
+// resetRekeyLocked clears rate-limit windows for a chat after teardown or success.
+// Caller must hold s.mu.
+func (s *AppRouterService) resetRekeyLocked(chatID string) {
+	if len(s.rekeyAttempts) == 0 || chatID == "" {
+		return
+	}
+	for key := range s.rekeyAttempts {
+		if key.chatID == chatID {
+			delete(s.rekeyAttempts, key)
+		}
+	}
+}
+
 func (s *AppRouterService) snapshotRatchets() []ratchetStatus {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1623,6 +1827,8 @@ func (s *AppRouterService) snapshotRatchets() []ratchetStatus {
 			LocalAppID:  tl.ratchetLocalID,
 			RemoteAppID: tl.ratchetRemoteID,
 			Derived:     tl.derivedVersion > 0,
+			Resumed:     tl.resumed,
+			Expired:     tl.keyExpired(time.Now(), s.maxKeyLifetime),
 		}
 		if tl.remote != nil {
 			status.RemoteNodeID = tl.remote.nodeID
@@ -1862,6 +2068,8 @@ type ratchetStatus struct {
 	LocalAppID   string    `json:"local_app_id,omitempty"`
 	RemoteAppID  string    `json:"remote_app_id,omitempty"`
 	Derived      bool      `json:"derived"`
+	Resumed      bool      `json:"resumed"`
+	Expired      bool      `json:"expired"`
 	RemoteNodeID string    `json:"remote_node_id,omitempty"`
 }
 
@@ -1891,6 +2099,8 @@ type tieline struct {
 	ratchetLocalID  string
 	ratchetRemoteID string
 	lastRatchet     time.Time
+	resumeSeq       map[string]uint64
+	resumed         bool
 }
 
 type remotePeer struct {
@@ -1913,6 +2123,38 @@ func newTieline(id string) *tieline {
 		participants: make(map[string]*chatParticipant),
 		lastActivity: time.Now(),
 	}
+}
+
+func (t *tieline) applyResume(rec keystore.ChatSecretRecord) {
+	clone := rec.Clone()
+	if t.secret != nil {
+		t.secret.Zero()
+	}
+	t.secret = &clone
+	t.keyVersion = rec.KeyVersion
+	t.hkdfInfo = string(rec.HKDFInfo)
+	t.hkdfSalt = cloneBytes(rec.HKDFSalt)
+	t.derivedVersion = rec.KeyVersion
+	t.ratchetLocalID = rec.LocalAppID
+	t.ratchetRemoteID = rec.RemoteAppID
+	t.lastRatchet = rec.RotatedAt
+	if t.lastRatchet.IsZero() {
+		t.lastRatchet = rec.CreatedAt
+	}
+	if t.resumeSeq == nil {
+		t.resumeSeq = make(map[string]uint64)
+	} else {
+		for k := range t.resumeSeq {
+			delete(t.resumeSeq, k)
+		}
+	}
+	if rec.LocalAppID != "" {
+		t.resumeSeq[rec.LocalAppID] = rec.SendCount
+	}
+	if rec.RemoteAppID != "" {
+		t.resumeSeq[rec.RemoteAppID] = rec.RecvCount
+	}
+	t.resumed = true
 }
 
 func (t *tieline) prepareVersion(version uint32, info string, salt []byte) error {
@@ -2073,6 +2315,9 @@ func (t *tieline) wipeSecrets() {
 		t.secret = nil
 	}
 	zeroBytes(t.hkdfSalt)
+	t.resumeSeq = nil
+	t.resumed = false
+	t.derivedVersion = 0
 	t.ratchetLocalID = ""
 	t.ratchetRemoteID = ""
 	t.lastRatchet = time.Time{}
@@ -2085,6 +2330,13 @@ func (t *tieline) participantForApp(appID string) *chatParticipant {
 		}
 	}
 	return nil
+}
+
+func (t *tieline) resumeSequence(appID string) uint64 {
+	if t.resumeSeq == nil {
+		return 0
+	}
+	return t.resumeSeq[appID]
 }
 
 func (t *tieline) ratchetDirection(appID string) ratchetDirection {
