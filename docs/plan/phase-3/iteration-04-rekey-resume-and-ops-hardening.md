@@ -16,3 +16,8 @@ Close the remaining Phase 3 gaps by hardening rekey/resume flows, ratchet backpr
 - Ratchet counters reload correctly after restart; divergence/rekey-required paths tear down and erase secrets consistently across nodes/apps.
 - Rate limits/backpressure for rekey/divergence are configurable and observable via metrics/logs.
 - Integration (Compose + CI) exercises the rekey/resume path (including restart/churn) and passes; documentation and guardrails reflect the new workflows and knobs.
+
+## Status update (2025-11-29)
+- Restart/resume harness landed: `docker-compose.rekey-resume.yaml` plus `scripts/run-restart-resume.sh` force rekey → SIGKILL restart → sealed keystore resume and now gate `make integration` and CI.
+- Cross-node RouteChat tests cover rekey/resume (remote setup, persisted counters, `REKEY_THROTTLED`/`REPLAYED_KEY` rejection) to prevent stale or repeated material after restarts.
+- README/wiki/AGENT/overview/release notes refreshed with restart/resume expectations, rekey error handling, and operator signals (`hermes_rekeys_total`, `/crypto/ratchets` `resumed`/`expired`).

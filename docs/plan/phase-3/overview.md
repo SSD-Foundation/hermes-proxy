@@ -20,9 +20,10 @@ Deliver Stage 3 from `docs/hermes-mvp-revised.md` for **nodes only**: enforce pe
 - App identity remains Ed25519; per-chat ephemeral keys use X25519; HKDF derives send/recv/mac/ratchet keys with versioning baked into metadata.
 - Mock app/client code must evolve with the handshake so component/integration tests can validate PFS behavior.
 
-## Current status (Phase 2 complete)
+## Current status (Phase 3 restart/resume gated)
 - Multi-node mesh, target-aware `StartChat`/`RouteChat`, SWIM-style gossip/churn handling, and sealed keystore storage for chat secrets are in place.
-- Crypto foundations landed: versioned chat-secret records with HKDF metadata/migration, X25519/HKDF helper library, and validated crypto knobs. Protocol wiring + HKDF derivation for StartChat/RouteChat are implemented; symmetric ratcheting/erasure/observability are landing, with rekey/resume handling still to harden.
+- Crypto foundations landed: versioned chat-secret records with HKDF metadata/migration, X25519/HKDF helper library, and validated crypto knobs. Protocol wiring + HKDF derivation and symmetric ratcheting/erasure/metrics are implemented. Rekey/resume loads sealed ratchet state, enforces version bumps + per-chat/app throttles, emits rekey metrics, and cross-node component tests cover replay/throttle/resume after restart.
+- Integration/CI now gate on a restart/resume Compose scenario (handshake → messaging → forced rekey → SIGKILL restart/resume → teardown) via `docker-compose.rekey-resume.yaml` and `scripts/run-restart-resume.sh` (`make integration`). Remaining work is operational polish (alerting/dashboard examples, optional mTLS for app↔node) and backlog hardening captured in iteration notes.
 
 ## Workstreams
 - **Protocols & envelopes:** Update `app_router.proto`/`nodemesh.proto` for X25519 key metadata, key versions, rekey/ratchet signals, and deterministic error codes.

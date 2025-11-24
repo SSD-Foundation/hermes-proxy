@@ -18,16 +18,16 @@ This file defines the mandatory operating rules for contributors and automation.
 ## Testing and coverage strategy
 - **Unit tests**: pure functions and small components (keystore crypto helpers, chat-secret record migrations, config parsing/validation for crypto knobs, membership state machine, routing table updates). Target ≥80% coverage for these packages. Fast, no network/filesystem side effects beyond temp dirs.
 - **Component tests**: in-process gRPC servers for AppRouter and NodeMesh; cover connect/auth, StartChat with target app identity and signed X25519 keys, replay/mismatch errors, rekey attempts, gossip/join flows, RouteChat setup/teardown, message relay ordering, and ratchet-triggered teardowns.
-- **Integration tests**: Dockerized multi-node harness (see deployment schemes) spinning up at least two node containers and two mock apps exercising StartChat → messaging with ratchets → rekey → teardown/expiry and a churn scenario (bounce a node). Must run locally via `docker compose` and in CI.
+- **Integration tests**: Dockerized multi-node harness (see deployment schemes) spinning up at least two node containers and two mock apps exercising StartChat → messaging with ratchets → rekey → restart/resume → teardown/churn (bounce a node) with sealed keystore reload. Must run locally via `docker compose`/`scripts/run-restart-resume.sh` and in CI.
 - Any new feature or bug fix must add or update tests in the relevant tier. Do not remove tests without replacements. If a test cannot be added, document why in the PR and the backlog item to close the gap. Keep this strategy updated when coverage expectations shift.
 
 ## Deployment schemes (must stay current)
 - **Local testing (Dockerized)**:
   - Multi-stage `Dockerfile` builds a slim runtime image.
-  - Compose stack runs multiple node containers (with TLS materials), two mock app containers, and optionally a metrics sink. Integration tests orchestrate PFS flows (handshake, ratchet, rekey, teardown) plus churn.
+  - Compose stack runs multiple node containers (with TLS materials), two mock app containers, and optionally a metrics sink. Integration tests orchestrate PFS flows (handshake, ratchet, rekey, restart/resume, teardown/churn) via `docker-compose.rekey-resume.yaml` and `scripts/run-restart-resume.sh` (forces SIGKILL restart and sealed keystore reload).
   - Compose must support running unit/component tests inside a node container for parity with CI.
 - **CI/CD (GitHub Actions)**:
-  - Workflow stages: checkout → lint → unit tests → component tests → build container → multi-node integration tests via Compose (including PFS/ratchet paths) → (optional) push image on main tags.
+  - Workflow stages: checkout → lint → unit tests → component tests → build container → multi-node integration tests via the restart/resume Compose harness (`docker-compose.rekey-resume.yaml` + `make integration`) → (optional) push image on main tags.
   - Cache proto/toolchain artifacts where possible; fail fast on lint or tests.
 - **Production deployment**:
   - Deploy the container image with env-configured secrets (keystore passphrase injected via secret manager) and TLS assets for node↔node/authenticated app↔node traffic.

@@ -719,6 +719,32 @@ func sendStartChatCustom(t *testing.T, stream approuterpb.AppRouter_OpenClient, 
 	}
 }
 
+func sendStartChatRekey(t *testing.T, stream approuterpb.AppRouter_OpenClient, chatID, targetAppID string, eph pfs.KeyPair, priv ed25519.PrivateKey, keyVersion uint32) {
+	t.Helper()
+	if keyVersion == 0 {
+		keyVersion = 1
+	}
+	appID := appIdentityKey(priv.Public().(ed25519.PublicKey))
+	payload := handshakePayload(chatID, appID, targetAppID, eph.Public, nil, "hermes-chat-session", keyVersion, true)
+	sig := ed25519.Sign(priv, payload)
+	if err := stream.Send(&approuterpb.AppFrame{
+		Body: &approuterpb.AppFrame_StartChat{
+			StartChat: &approuterpb.StartChat{
+				ChatId:                   chatID,
+				TargetAppId:              targetAppID,
+				LocalEphemeralPublicKey:  eph.Public,
+				LocalEphemeralPrivateKey: eph.Private,
+				Signature:                sig,
+				KeyVersion:               keyVersion,
+				HkdfInfo:                 "hermes-chat-session",
+				Rekey:                    true,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("send rekey start chat: %v", err)
+	}
+}
+
 func expectConnectAck(t *testing.T, stream approuterpb.AppRouter_OpenClient) {
 	t.Helper()
 	frame := recvFrame(t, stream)
@@ -863,6 +889,59 @@ func seedResumeRecord(t *testing.T, ks *memoryKeystore, chatID string, app1, app
 		LocalPrivate: append([]byte(nil), localPair.Private...),
 		LocalAppID:   localAppID,
 		RemoteAppID:  remoteAppID,
+		HKDFInfo:     []byte(hkdfInfo),
+		SendKey:      append([]byte(nil), keys.SendKey...),
+		RecvKey:      append([]byte(nil), keys.RecvKey...),
+		MACKey:       append([]byte(nil), keys.MACKey...),
+		RatchetSeed:  append([]byte(nil), keys.RatchetKey...),
+		SendCount:    sendCount,
+		RecvCount:    recvCount,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := ks.StoreChatSecret(context.Background(), record); err != nil {
+		t.Fatalf("seed chat secret: %v", err)
+	}
+}
+
+func seedResumeRecordForLocal(t *testing.T, ks *memoryKeystore, chatID string, localApp, remoteApp ed25519.PublicKey, localPair, remotePair pfs.KeyPair, keyVersion uint32, hkdfInfo string, sendCount, recvCount uint64) {
+	t.Helper()
+	if keyVersion == 0 {
+		keyVersion = 1
+	}
+	if hkdfInfo == "" {
+		hkdfInfo = "hermes-chat-session"
+	}
+
+	shared, err := pfs.SharedSecret(localPair.Private, remotePair.Public)
+	if err != nil {
+		t.Fatalf("derive shared secret: %v", err)
+	}
+	keys, err := pfs.DeriveSessionKeys(shared, nil, []byte(hkdfInfo), crypto.SHA256, pfs.SessionKeySizes{})
+	if err != nil {
+		t.Fatalf("derive session keys: %v", err)
+	}
+	defer keys.Zero()
+
+	localKeyID, err := pfs.KeyIdentifier(localPair.Public)
+	if err != nil {
+		t.Fatalf("local key id: %v", err)
+	}
+	remoteKeyID, err := pfs.KeyIdentifier(remotePair.Public)
+	if err != nil {
+		t.Fatalf("remote key id: %v", err)
+	}
+
+	record := keystore.ChatSecretRecord{
+		Version:      1,
+		ChatID:       chatID,
+		KeyVersion:   keyVersion,
+		LocalKeyID:   localKeyID,
+		RemoteKeyID:  remoteKeyID,
+		LocalPublic:  append([]byte(nil), localPair.Public...),
+		RemotePublic: append([]byte(nil), remotePair.Public...),
+		LocalPrivate: append([]byte(nil), localPair.Private...),
+		LocalAppID:   appIdentityKey(localApp),
+		RemoteAppID:  appIdentityKey(remoteApp),
 		HKDFInfo:     []byte(hkdfInfo),
 		SendKey:      append([]byte(nil), keys.SendKey...),
 		RecvKey:      append([]byte(nil), keys.RecvKey...),

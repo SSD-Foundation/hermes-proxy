@@ -385,13 +385,22 @@ func (s *AppRouterService) handleStartChat(session *appSession, start *approuter
 		tl.metadata = cloneMetadata(start.Metadata)
 	}
 	if tl.secret == nil && resumeRec != nil {
-		tl.applyResume(*resumeRec)
-		s.recordRekey("resume")
+		if start.Rekey && resumeRec.KeyVersion < start.KeyVersion {
+			resumeRec = nil
+		} else {
+			tl.applyResume(*resumeRec)
+			s.recordRekey("resume")
+		}
 	}
 
 	prevVersion := tl.keyVersion
 	if start.Rekey {
-		if prevVersion > 0 && start.KeyVersion <= prevVersion {
+		if prevVersion > 0 && start.KeyVersion < prevVersion {
+			s.recordRekey("stale")
+			s.mu.Unlock()
+			return &routeError{code: "REPLAYED_KEY", msg: "rekey version must increase"}
+		}
+		if prevVersion > 0 && start.KeyVersion == prevVersion && tl.derivedVersion >= start.KeyVersion {
 			s.recordRekey("stale")
 			s.mu.Unlock()
 			return &routeError{code: "REPLAYED_KEY", msg: "rekey version must increase"}
@@ -930,13 +939,22 @@ func (s *AppRouterService) handleRouteSetup(fromNode string, setup *nodemeshpb.S
 		s.incChat()
 	}
 	if tl.secret == nil && resumeRec != nil {
-		tl.applyResume(*resumeRec)
-		s.recordRekey("resume")
+		if setup.Rekey && resumeRec.KeyVersion < setup.KeyVersion {
+			resumeRec = nil
+		} else {
+			tl.applyResume(*resumeRec)
+			s.recordRekey("resume")
+		}
 	}
 
 	prevVersion := tl.keyVersion
 	if setup.Rekey {
-		if prevVersion > 0 && setup.KeyVersion <= prevVersion {
+		if prevVersion > 0 && setup.KeyVersion < prevVersion {
+			s.recordRekey("stale")
+			s.mu.Unlock()
+			return nil, &mesh.RouteError{Code: "REPLAYED_KEY", Msg: "rekey version must increase"}
+		}
+		if prevVersion > 0 && setup.KeyVersion == prevVersion && tl.derivedVersion >= setup.KeyVersion {
 			s.recordRekey("stale")
 			s.mu.Unlock()
 			return nil, &mesh.RouteError{Code: "REPLAYED_KEY", Msg: "rekey version must increase"}

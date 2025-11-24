@@ -1,6 +1,6 @@
-# HERMES Nodes (Phase 2 – mesh bootstrap)
+# HERMES Nodes (Phase 3 – restart/resume gating)
 
-This repository tracks the HERMES router nodes. Phase 1 delivers a gRPC-based service that connects Apps, manages encrypted 1:1 chats on a single node, and prepares the groundwork for the mesh, payments, and NAT features that follow. Phase 2 layers NodeMesh membership, peer discovery, and cross-node routing (implemented) on top of the existing chat plumbing. Phase 3 (per-chat PFS with signed X25519 exchange, HKDF-derived session keys, and ratcheting) is underway: iteration 02 landed the signed X25519/HKDF handshake and iteration 03 adds per-message ratchets, teardown on divergence/expiry, admin visibility, and coverage per `docs/plan/phase-3/`. Platform target is Ubuntu Linux; the Phase 2 plan lives under `docs/plan/phase-2/`.
+This repository tracks the HERMES router nodes. Phase 1 delivers a gRPC-based service that connects Apps, manages encrypted 1:1 chats on a single node, and prepares the groundwork for the mesh, payments, and NAT features that follow. Phase 2 layers NodeMesh membership, peer discovery, and cross-node routing (implemented) on top of the existing chat plumbing. Phase 3 (per-chat PFS with signed X25519 exchange, HKDF-derived session keys, and ratcheting) now includes cross-node rekey/resume coverage with a restart/resume CI gate (iteration 05) per `docs/plan/phase-3/`. Platform target is Ubuntu Linux; the Phase 2 plan lives under `docs/plan/phase-2/`.
 
 ## Getting started
 - Read the MVP scope in `docs/hermes-mvp-revised.md`.
@@ -16,7 +16,7 @@ This repository tracks the HERMES router nodes. Phase 1 delivers a gRPC-based se
   - `make lint` – run `go vet`.
   - `make test` – run unit + component tests (AppRouter flows + NodeMesh join/membership).
   - `make build` – build all packages.
-  - `make integration` – build the Docker image and run the Compose harness (node + two mock apps).
+  - `make integration` – build the Docker image and run the restart/resume Compose harness (two nodes + two mock apps) via `scripts/run-restart-resume.sh`.
   - `make proto` – regenerate gRPC stubs from `proto/app_router.proto` and `proto/nodemesh.proto`.
   - `go test ./internal/server` – component tests for connect/start chat/send/delete happy path, signature failure, and cross-node routing.
 
@@ -93,8 +93,8 @@ Crypto parameters govern the HKDF hash/info label used for per-chat derivation, 
 - TLS between nodes is configurable under `mesh.tls` (disabled by default for dev/test); when enabled the gRPC server uses the provided cert/key and optional CA for peer auth and the dialer/route pool reuse the same materials for outbound streams.
 
 ## Docker & integration harness
-- `docker-compose.dev.yaml` builds/runs the node plus two `mockapp` clients that exercise the happy-path chat flow (two messages per chat by default to advance ratchets; override with `--messages`). Run `make integration` to build the image, start the stack, wait for both apps to exit, and tear everything down.
-- The image produced by `Dockerfile` contains both binaries (`node` and `mockapp`), listens on `50051` for gRPC and `8080` for health/metrics, and persists the keystore to `/app/data` (Compose mounts a named volume).
+- `docker-compose.rekey-resume.yaml` spins up two nodes and two `mockapp` clients that rekey to version 2, send a pre-restart message, restart both nodes (hard kill), resume from sealed keystore state, send a post-restart message, and tear down cleanly. Run `make integration` to build the image, start the stack, restart the nodes, wait on both app containers, and clean up (scripted via `scripts/run-restart-resume.sh`).
+- The image produced by `Dockerfile` contains both binaries (`node` and `mockapp`), listens on `50051` for gRPC and `8080` for health/metrics by default, and persists the keystore to `/app/data` (Compose mounts named volumes per node; see `config/node1.yaml` and `config/node2.yaml` for mesh addresses and ports).
 - The admin endpoints exposed in the container are the same as local runs: `/healthz`, `/readyz`, `/metrics`.
 
 ## Project structure

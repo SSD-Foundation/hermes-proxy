@@ -24,19 +24,4 @@ build:
 check: fmt lint test
 
 integration:
-	@set -e; \
-	trap 'docker compose -f docker-compose.dev.yaml down --remove-orphans' EXIT; \
-	docker compose -f docker-compose.dev.yaml up -d --build; \
-	ids=$$(docker compose -f docker-compose.dev.yaml ps -a -q app1 app2); \
-	if [ -z "$$ids" ]; then \
-		echo "integration containers missing (app1/app2)"; \
-		docker compose -f docker-compose.dev.yaml ps; \
-		exit 1; \
-	fi; \
-	statuses=$$(docker wait $$ids); \
-	echo "$$statuses" | awk '{print "exit status:", $$0}'; \
-	if echo "$$statuses" | grep -Ev '^0$$' >/dev/null; then \
-		echo "integration containers exited with failure"; \
-		docker compose -f docker-compose.dev.yaml logs app1 app2; \
-		exit 1; \
-	fi
+	@COMPOSE_FILE=docker-compose.rekey-resume.yaml scripts/run-restart-resume.sh

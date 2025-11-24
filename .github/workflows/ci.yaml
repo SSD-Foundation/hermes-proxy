@@ -37,7 +37,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build container images
-        run: docker compose -f docker-compose.dev.yaml build
+        run: docker compose -f docker-compose.rekey-resume.yaml build
 
       - name: Run integration chat harness
         run: make integration
