@@ -1,10 +1,10 @@
-# HERMES Nodes (Phase 2 – mesh bootstrap)
+# HERMES Nodes (Phase 3 – restart/resume gating)
 
-This repository tracks the HERMES router nodes. Phase 1 delivers a gRPC-based service that connects Apps, manages encrypted 1:1 chats on a single node, and prepares the groundwork for the mesh, payments, and NAT features that follow. Phase 2 layers NodeMesh membership, peer discovery, and cross-node routing (implemented) on top of the existing chat plumbing. Platform target is Ubuntu Linux; the Phase 2 plan lives under `docs/plan/phase-2/`.
+This repository tracks the HERMES router nodes. Phase 1 delivers a gRPC-based service that connects Apps, manages encrypted 1:1 chats on a single node, and prepares the groundwork for the mesh, payments, and NAT features that follow. Phase 2 layers NodeMesh membership, peer discovery, and cross-node routing (implemented) on top of the existing chat plumbing. Phase 3 (per-chat PFS with signed X25519 exchange, HKDF-derived session keys, and ratcheting) now includes cross-node rekey/resume coverage with a restart/resume CI gate (iteration 05) per `docs/plan/phase-3/`. Platform target is Ubuntu Linux; the Phase 2 plan lives under `docs/plan/phase-2/`.
 
 ## Getting started
 - Read the MVP scope in `docs/hermes-mvp-revised.md`.
-- Review the Phase 1 plan and iteration prompts in `docs/plan/phase-1/` and the Phase 2 plan in `docs/plan/phase-2/`.
+- Review the Phase 1 plan and iteration prompts in `docs/plan/phase-1/`, the Phase 2 plan in `docs/plan/phase-2/`, and the Phase 3 PFS plan in `docs/plan/phase-3/`.
 - The gRPC contracts live in `proto/app_router.proto` and `proto/nodemesh.proto` with generated Go stubs in `pkg/api/approuterpb` and `pkg/api/nodemeshpb`.
 - The node binary entrypoint is `cmd/node` and hosts both `AppRouter.Open` (app connect/start chat/send/delete) and the new `NodeMesh` service for join/gossip/route envelopes.
 
@@ -16,7 +16,7 @@ This repository tracks the HERMES router nodes. Phase 1 delivers a gRPC-based se
   - `make lint` – run `go vet`.
   - `make test` – run unit + component tests (AppRouter flows + NodeMesh join/membership).
   - `make build` – build all packages.
-  - `make integration` – build the Docker image and run the Compose harness (node + two mock apps).
+  - `make integration` – build the Docker image and run the restart/resume Compose harness (two nodes + two mock apps) via `scripts/run-restart-resume.sh`.
   - `make proto` – regenerate gRPC stubs from `proto/app_router.proto` and `proto/nodemesh.proto`.
   - `go test ./internal/server` – component tests for connect/start chat/send/delete happy path, signature failure, and cross-node routing.
 
@@ -28,7 +28,7 @@ export HERMES_KEYSTORE_PASSPHRASE=change-me
 go run ./cmd/node --config config/dev.yaml
 ```
 
-If the keystore file does not exist, it is initialized automatically at the configured path. A small admin HTTP server (default `:8080`) serves `GET /healthz`, `GET /readyz`, Prometheus metrics at `GET /metrics`, and a membership dump at `GET /mesh/members` for mesh debugging. Mesh metrics include node counts, join/app sync counters, and churn visibility (`hermes_mesh_suspected_peers`, `hermes_mesh_evicted_peers_total`).
+If the keystore file does not exist, it is initialized automatically at the configured path. A small admin HTTP server (default `:8080`) serves `GET /healthz`, `GET /readyz`, Prometheus metrics at `GET /metrics`, a membership dump at `GET /mesh/members`, and ratchet status at `GET /crypto/ratchets` (non-secret counters/versions) for crypto debugging. Mesh metrics include node counts, join/app sync counters, and churn visibility (`hermes_mesh_suspected_peers`, `hermes_mesh_evicted_peers_total`); router metrics now include ratchet/erasure counters.
 
 ## Configuration
 Configuration is read from a file plus environment overrides (`HERMES_` prefix). Example:
@@ -62,13 +62,27 @@ cleanup:
   sweep_interval: "30s"
   session_idle_timeout: "5m"
   chat_idle_timeout: "10m"
+crypto:
+  hkdf_hash: "sha256"
+  hkdf_info_label: "hermes-chat-session"
+  max_key_lifetime: "24h"
+  rekey_interval: "30s"
+  max_rekeys_per_chat: 3
 grpc_server:
   max_recv_msg_size: 4194304
   max_send_msg_size: 4194304
   keepalive_time: "2m"
   keepalive_timeout: "20s"
   max_connection_idle: "0s" # 0 defers to cleanup.session_idle_timeout
+crypto:
+  hkdf_hash: "sha256"              # sha256 or sha512
+  hkdf_info_label: "hermes-chat-session"
+  max_key_lifetime: "24h"          # bounds validated at startup
+  rekey_interval: "30s"            # rate-limit window for rekey attempts
+  max_rekeys_per_chat: 3           # attempts per chat/app before REKEY_THROTTLED
 ```
+
+Crypto parameters govern the HKDF hash/info label used for per-chat derivation, the maximum key lifetime before rekey, and the rekey throttle window; invalid values are rejected at startup.
 
 ## Mesh bootstrap
 - Node identity (ed25519) is stored in the sealed keystore under `mesh.identity_secret` and advertised during `NodeMesh.Join` alongside the node ID, wallet placeholder, and public endpoint.
@@ -79,8 +93,8 @@ grpc_server:
 - TLS between nodes is configurable under `mesh.tls` (disabled by default for dev/test); when enabled the gRPC server uses the provided cert/key and optional CA for peer auth and the dialer/route pool reuse the same materials for outbound streams.
 
 ## Docker & integration harness
-- `docker-compose.dev.yaml` builds/runs the node plus two `mockapp` clients that exercise the happy-path chat flow. Run `make integration` to build the image, start the stack, wait for both apps to exit, and tear everything down.
-- The image produced by `Dockerfile` contains both binaries (`node` and `mockapp`), listens on `50051` for gRPC and `8080` for health/metrics, and persists the keystore to `/app/data` (Compose mounts a named volume).
+- `docker-compose.rekey-resume.yaml` spins up two nodes and two `mockapp` clients that rekey to version 2, send a pre-restart message, restart both nodes (hard kill), resume from sealed keystore state, send a post-restart message, and tear down cleanly. Run `make integration` to build the image, start the stack, restart the nodes, wait on both app containers, and clean up (scripted via `scripts/run-restart-resume.sh`).
+- The image produced by `Dockerfile` contains both binaries (`node` and `mockapp`), listens on `50051` for gRPC and `8080` for health/metrics by default, and persists the keystore to `/app/data` (Compose mounts named volumes per node; see `config/node1.yaml` and `config/node2.yaml` for mesh addresses and ports).
 - The admin endpoints exposed in the container are the same as local runs: `/healthz`, `/readyz`, `/metrics`.
 
 ## Project structure
@@ -90,12 +104,14 @@ grpc_server:
 - `proto/nodemesh.proto`: NodeMesh protobuf contract (Join/Gossip/RouteChat envelopes); generated code in `pkg/api/nodemeshpb`.
 - `internal/config`: Config loader with env overrides and server tuning defaults.
 - `internal/keystore`: Argon2id-derived file backend (sealed storage with tamper detection) with tests.
+- `internal/crypto/pfs`: X25519 helpers (key IDs, shared secret) and HKDF derivation for send/recv/mac/ratchet material with deterministic vectors.
 - `internal/registry`: In-memory chat/tieline registry and app presence map.
 - `internal/mesh`: NodeMesh membership store, gRPC server, and bootstrap dialer.
 - `internal/server`: gRPC server wiring, `AppRouter` implementation (connect handshake, chat routing, teardown, metrics, housekeeping), NodeMesh service, and admin endpoints.
 - `docs/hermes-mvp-revised.md`: Revised MVP specification.
 - `docs/plan/phase-1/`: Implementation plan and iteration prompts for the delivered single-node scope.
 - `docs/plan/phase-2/`: Implementation plan and iteration prompts for the mesh/discovery scope.
+- `docs/plan/phase-3/`: Implementation plan and iteration prompts for per-chat PFS (key exchange, HKDF, ratcheting, erasure).
 - `docs/wiki/core-node-functionality.md`: Core behavior and operational notes (kept current as features land).
 - `AGENT.md`: Mandatory guardrails for testing, deployment, and docs maintenance.
 - `release-notes.md`: Latest user-visible changes.
@@ -103,8 +119,9 @@ grpc_server:
 ## AppRouter chat flow (single + cross-node)
 - Connect: app sends `Connect` with ed25519 identity pubkey and signature over node ID + metadata; node replies with `ConnectAck`, registers the session, and syncs app presence into the routing table.
 - StartChat: each peer sends `StartChat` with `chat_id`, `target_app_id` (optional `target_node_hint`), and a signed ephemeral pubkey. The node resolves the target via the routing table (local registry + mesh AppSync) and opens/joins a `RouteChat` tieline if the target lives on another node. `StartChatAck` is sent once accepted; the peer’s ephemeral key is delivered via a server-initiated `StartChat` frame once both keys are present. `FindApp` frames return the hosting node for a target app identity.
-- SendChatMessage: AEAD ciphertext envelopes are relayed locally or over `RouteChat`; per-sender sequence numbers must be monotonic. `ChatMessageAck` is emitted after the remote hop ACKs to preserve end-to-end backpressure across nodes.
-- DeleteChat: caller triggers teardown and key erasure; both peers receive `DeleteChatAck` (`deleted` / `deleted_by_peer`). Route loss or remote teardown returns `DeleteChatAck` with `route_closed`/`route_unavailable` as appropriate.
+- SendChatMessage: AEAD ciphertext envelopes are relayed locally or over `RouteChat`; per-sender sequence numbers must be monotonic and drive symmetric ratchets. Ratchet state (send/recv counters) is sealed in the keystore and advanced on each message; divergence returns `RATCHET_DESYNC` + `DeleteChatAck` with `ratchet_desync` and erases secrets locally/remote. Keys that exceed `crypto.max_key_lifetime` trigger `rekey_required` teardowns. `ChatMessageAck` is emitted after the remote hop ACKs to preserve end-to-end backpressure across nodes.
+- Rekey/resume: rekey attempts must set `rekey=true` with an incremented `key_version`; duplicate/stale attempts return `REPLAYED_KEY` and rekeys are rate-limited per chat/app (`REKEY_THROTTLED`). On node restart or chat resume, sealed ratchet state (keys + send/recv counters) is loaded from the keystore so the next expected sequence is enforced. Prometheus exposes `hermes_rekeys_total{result=…}` and `/crypto/ratchets` now reports `resumed`/`expired` flags alongside key versions.
+- DeleteChat: caller triggers teardown and key erasure; both peers receive `DeleteChatAck` (`deleted` / `deleted_by_peer`). Route loss or remote teardown returns `DeleteChatAck` with `route_closed`/`route_unavailable` as appropriate. Ratchet failures/expiry return `ratchet_desync`/`rekey_required`.
 - Housekeeping: idle chats are expired by the server (`cleanup.chat_idle_timeout`), propagate a remote teardown, and return `DeleteChatAck` with `expired`; per-chat secrets and ephemeral keys are wiped from memory and the keystore.
 - Heartbeat: echoed to keep the stream warm and track liveness.
 

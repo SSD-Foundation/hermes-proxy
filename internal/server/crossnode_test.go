@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hermes-proxy/hermes-proxy/internal/keystore"
 	"github.com/hermes-proxy/hermes-proxy/internal/mesh"
 	"github.com/hermes-proxy/hermes-proxy/internal/registry"
 	"github.com/hermes-proxy/hermes-proxy/pkg/api/approuterpb"
@@ -64,21 +65,49 @@ func TestCrossNodeRoutingHappyPath(t *testing.T) {
 	nodeB.store.MergeApps(nodeA.store.Apps(), now)
 
 	chatID := "cross-node-chat"
-	ephA := mustRandBytes(t, 32)
-	ephB := mustRandBytes(t, 32)
+	ephA := mustEphemeral(t)
+	ephB := mustEphemeral(t)
 
 	sendStartChat(t, streamA, chatID, appBID, ephA, appAPriv)
 	expectStartChatAck(t, streamA, chatID)
 	sendStartChat(t, streamB, chatID, appAID, ephB, appBPriv)
 	expectStartChatAck(t, streamB, chatID)
 
-	peerA := waitForStartChat(t, streamA)
-	if !bytes.Equal(peerA.PeerPublicEphemeralKey, ephB) {
-		t.Fatalf("node A expected peer key %x, got %x", ephB, peerA.PeerPublicEphemeralKey)
+	peerA := waitForStartChatOrError(t, streamA)
+	if !bytes.Equal(peerA.LocalEphemeralPublicKey, ephB.Public) {
+		t.Fatalf("node A expected peer key %x, got %x", ephB.Public, peerA.LocalEphemeralPublicKey)
 	}
-	peerB := waitForStartChat(t, streamB)
-	if !bytes.Equal(peerB.PeerPublicEphemeralKey, ephA) {
-		t.Fatalf("node B expected peer key %x, got %x", ephA, peerB.PeerPublicEphemeralKey)
+	peerB := waitForStartChatOrError(t, streamB)
+	if !bytes.Equal(peerB.LocalEphemeralPublicKey, ephA.Public) {
+		t.Fatalf("node B expected peer key %x, got %x", ephA.Public, peerB.LocalEphemeralPublicKey)
+	}
+	if peerA.KeyVersion != 1 || peerB.KeyVersion != 1 {
+		t.Fatalf("expected key version 1, got %d and %d", peerA.KeyVersion, peerB.KeyVersion)
+	}
+	if peerA.HkdfInfo != "hermes-chat-session" || peerB.HkdfInfo != "hermes-chat-session" {
+		t.Fatalf("unexpected hkdf info in remote start chat")
+	}
+	waitForSecret := func(ks *memoryKeystore, id string) keystore.ChatSecretRecord {
+		for i := 0; i < 10; i++ {
+			if ks.has(id) {
+				rec, err := ks.LoadChatSecret(context.Background(), id)
+				if err == nil {
+					return rec
+				}
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		return keystore.ChatSecretRecord{}
+	}
+	if rec := waitForSecret(nodeA.ks, chatID); rec.ChatID == "" {
+		t.Fatalf("nodeA expected chat secret")
+	} else if rec.KeyVersion != 1 {
+		t.Fatalf("nodeA expected key version 1, got %d", rec.KeyVersion)
+	}
+	if rec := waitForSecret(nodeB.ks, chatID); rec.ChatID == "" {
+		t.Fatalf("nodeB expected chat secret")
+	} else if rec.KeyVersion != 1 {
+		t.Fatalf("nodeB expected key version 1, got %d", rec.KeyVersion)
 	}
 
 	payload := []byte("0123456789abcdefpayload")
@@ -136,15 +165,20 @@ func TestCrossNodeUnknownTarget(t *testing.T) {
 	sendConnectFrame(t, stream, nodeA.id, appPub, appPriv, nil)
 	expectConnectAck(t, stream)
 
-	eph := mustRandBytes(t, 32)
+	eph := mustEphemeral(t)
+	appID := appIdentityKey(appPub)
+	payload := handshakePayload("missing-chat", appID, "missing-target", eph.Public, nil, "hermes-chat-session", 1, false)
 	if err := stream.Send(&approuterpb.AppFrame{
 		Body: &approuterpb.AppFrame_StartChat{
 			StartChat: &approuterpb.StartChat{
-				ChatId:                 "missing-chat",
-				TargetAppId:            "missing-target",
-				TargetNodeHint:         "missing-node",
-				PeerPublicEphemeralKey: eph,
-				Signature:              ed25519.Sign(appPriv, eph),
+				ChatId:                   "missing-chat",
+				TargetAppId:              "missing-target",
+				TargetNodeHint:           "missing-node",
+				LocalEphemeralPublicKey:  eph.Public,
+				LocalEphemeralPrivateKey: eph.Private,
+				Signature:                ed25519.Sign(appPriv, payload),
+				KeyVersion:               1,
+				HkdfInfo:                 "hermes-chat-session",
 			},
 		},
 	}); err != nil {
@@ -215,13 +249,13 @@ func TestCrossNodeRouteLossTriggersTeardown(t *testing.T) {
 	nodeB.store.MergeApps(nodeA.store.Apps(), now)
 
 	chatID := "route-loss"
-	sendStartChat(t, streamA, chatID, appBID, mustRandBytes(t, 32), appAPriv)
+	sendStartChat(t, streamA, chatID, appBID, mustEphemeral(t), appAPriv)
 	expectStartChatAck(t, streamA, chatID)
-	sendStartChat(t, streamB, chatID, appAID, mustRandBytes(t, 32), appBPriv)
+	sendStartChat(t, streamB, chatID, appAID, mustEphemeral(t), appBPriv)
 	expectStartChatAck(t, streamB, chatID)
 
-	_ = waitForStartChat(t, streamA)
-	_ = waitForStartChat(t, streamB)
+	_ = waitForStartChatOrError(t, streamA)
+	_ = waitForStartChatOrError(t, streamB)
 
 	nodeB.stop()
 
@@ -233,6 +267,388 @@ func TestCrossNodeRouteLossTriggersTeardown(t *testing.T) {
 	if ack.DeleteChatAck.Status != "route_closed" {
 		t.Fatalf("expected route_closed status, got %s", ack.DeleteChatAck.Status)
 	}
+}
+
+func TestCrossNodeRekeyAndResumeHappyPath(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	t.Cleanup(cancel)
+
+	nodeA := startMeshTestNode(t, "node-a")
+	nodeB := startMeshTestNode(t, "node-b")
+	defer nodeA.stop()
+	defer nodeB.stop()
+
+	now := time.Now()
+	nodeA.store.MergeMembers([]mesh.Member{nodeB.member}, now)
+	nodeB.store.MergeMembers([]mesh.Member{nodeA.member}, now)
+
+	connA := dialClient(t, ctx, nodeA.addr)
+	connB := dialClient(t, ctx, nodeB.addr)
+	t.Cleanup(func() {
+		connA.Close()
+		connB.Close()
+	})
+
+	clientA := approuterpb.NewAppRouterClient(connA)
+	clientB := approuterpb.NewAppRouterClient(connB)
+
+	streamA, err := clientA.Open(ctx)
+	if err != nil {
+		t.Fatalf("open stream A: %v", err)
+	}
+	streamB, err := clientB.Open(ctx)
+	if err != nil {
+		t.Fatalf("open stream B: %v", err)
+	}
+
+	appAPub, appAPriv := mustKeypair(t)
+	appBPub, appBPriv := mustKeypair(t)
+	appAID := appIdentityKey(appAPub)
+	appBID := appIdentityKey(appBPub)
+
+	sendConnectFrame(t, streamA, nodeA.id, appAPub, appAPriv, nil)
+	sendConnectFrame(t, streamB, nodeB.id, appBPub, appBPriv, nil)
+	expectConnectAck(t, streamA)
+	expectConnectAck(t, streamB)
+
+	now = time.Now()
+	nodeA.store.MergeApps(nodeB.store.Apps(), now)
+	nodeB.store.MergeApps(nodeA.store.Apps(), now)
+
+	chatID := "cross-rekey-resume"
+	ephA1 := mustEphemeral(t)
+	ephB1 := mustEphemeral(t)
+
+	sendStartChat(t, streamA, chatID, appBID, ephA1, appAPriv)
+	expectStartChatAck(t, streamA, chatID)
+	sendStartChat(t, streamB, chatID, appAID, ephB1, appBPriv)
+	expectStartChatAck(t, streamB, chatID)
+
+	_ = waitForStartChatOrError(t, streamA)
+	_ = waitForStartChatOrError(t, streamB)
+
+	initialA := waitForSecretVersion(t, nodeA.ks, chatID, 1)
+	initialB := waitForSecretVersion(t, nodeB.ks, chatID, 1)
+
+	payload := []byte("rekey-payload-01")
+	if err := streamA.Send(&approuterpb.AppFrame{
+		Body: &approuterpb.AppFrame_ChatMessage{
+			ChatMessage: &approuterpb.ChatMessage{
+				ChatId:   chatID,
+				Payload:  payload,
+				Sequence: 1,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("send chat message: %v", err)
+	}
+	expectChatAck(t, streamA, chatID, 1)
+	msgB := waitForChatMessage(t, streamB)
+	if msgB.Sequence != 1 {
+		t.Fatalf("expected seq 1 on receiver, got %d", msgB.Sequence)
+	}
+
+	ephA2 := mustEphemeral(t)
+	ephB2 := mustEphemeral(t)
+	sendStartChatRekey(t, streamA, chatID, appBID, ephA2, appAPriv, 2)
+	expectStartChatAck(t, streamA, chatID)
+	sendStartChatRekey(t, streamB, chatID, appAID, ephB2, appBPriv, 2)
+	expectStartChatAck(t, streamB, chatID)
+
+	peerA := waitForStartChatOrError(t, streamA)
+	if peerA.KeyVersion != 2 || !peerA.Rekey {
+		t.Fatalf("expected rekey start for node A with version 2, got version %d rekey=%v", peerA.KeyVersion, peerA.Rekey)
+	}
+	peerB := waitForStartChatOrError(t, streamB)
+	if peerB.KeyVersion != 2 || !peerB.Rekey {
+		t.Fatalf("expected rekey start for node B with version 2, got version %d rekey=%v", peerB.KeyVersion, peerB.Rekey)
+	}
+
+	finalA := waitForSecretVersion(t, nodeA.ks, chatID, 2)
+	finalB := waitForSecretVersion(t, nodeB.ks, chatID, 2)
+	if bytes.Equal(initialA.SendKey, finalA.SendKey) || bytes.Equal(initialB.SendKey, finalB.SendKey) {
+		t.Fatalf("expected ratchet keys to change after rekey")
+	}
+
+	payload2 := []byte("rekey-payload-02")
+	if err := streamA.Send(&approuterpb.AppFrame{
+		Body: &approuterpb.AppFrame_ChatMessage{
+			ChatMessage: &approuterpb.ChatMessage{
+				ChatId:   chatID,
+				Payload:  payload2,
+				Sequence: 1,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("send post-rekey message: %v", err)
+	}
+	expectChatAck(t, streamA, chatID, 1)
+	msgAfter := waitForChatMessage(t, streamB)
+	if msgAfter.Sequence != 1 {
+		t.Fatalf("expected seq 1 after rekey, got %d", msgAfter.Sequence)
+	}
+
+	if err := streamA.Send(&approuterpb.AppFrame{
+		Body: &approuterpb.AppFrame_DeleteChat{
+			DeleteChat: &approuterpb.DeleteChat{ChatId: chatID, Reason: "done"},
+		},
+	}); err != nil {
+		t.Fatalf("send delete chat: %v", err)
+	}
+	expectDeleteAck(t, streamA, "deleted")
+	expectDeleteAck(t, streamB, "deleted_by_peer")
+}
+
+func TestCrossNodeRekeyThrottleAndReplay(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	t.Cleanup(cancel)
+
+	nodeA := startMeshTestNode(t, "node-a")
+	nodeB := startMeshTestNode(t, "node-b")
+	defer nodeA.stop()
+	defer nodeB.stop()
+
+	// tighten rekey window/limit to force throttling quickly
+	nodeA.router.rekeyLimit = 1
+	nodeA.router.rekeyWindow = time.Minute
+	nodeB.router.rekeyLimit = 1
+	nodeB.router.rekeyWindow = time.Minute
+
+	now := time.Now()
+	nodeA.store.MergeMembers([]mesh.Member{nodeB.member}, now)
+	nodeB.store.MergeMembers([]mesh.Member{nodeA.member}, now)
+
+	connA := dialClient(t, ctx, nodeA.addr)
+	connB := dialClient(t, ctx, nodeB.addr)
+	t.Cleanup(func() {
+		connA.Close()
+		connB.Close()
+	})
+
+	clientA := approuterpb.NewAppRouterClient(connA)
+	clientB := approuterpb.NewAppRouterClient(connB)
+
+	streamA, err := clientA.Open(ctx)
+	if err != nil {
+		t.Fatalf("open stream A: %v", err)
+	}
+	streamB, err := clientB.Open(ctx)
+	if err != nil {
+		t.Fatalf("open stream B: %v", err)
+	}
+
+	appAPub, appAPriv := mustKeypair(t)
+	appBPub, appBPriv := mustKeypair(t)
+	appAID := appIdentityKey(appAPub)
+	appBID := appIdentityKey(appBPub)
+
+	sendConnectFrame(t, streamA, nodeA.id, appAPub, appAPriv, nil)
+	sendConnectFrame(t, streamB, nodeB.id, appBPub, appBPriv, nil)
+	expectConnectAck(t, streamA)
+	expectConnectAck(t, streamB)
+
+	now = time.Now()
+	nodeA.store.MergeApps(nodeB.store.Apps(), now)
+	nodeB.store.MergeApps(nodeA.store.Apps(), now)
+
+	chatID := "cross-rekey-throttle"
+	ephA1 := mustEphemeral(t)
+	ephB1 := mustEphemeral(t)
+
+	sendStartChat(t, streamA, chatID, appBID, ephA1, appAPriv)
+	expectStartChatAck(t, streamA, chatID)
+	sendStartChat(t, streamB, chatID, appAID, ephB1, appBPriv)
+	expectStartChatAck(t, streamB, chatID)
+
+	_ = waitForStartChatOrError(t, streamA)
+	_ = waitForStartChatOrError(t, streamB)
+
+	ephA2 := mustEphemeral(t)
+	ephB2 := mustEphemeral(t)
+	sendStartChatRekey(t, streamA, chatID, appBID, ephA2, appAPriv, 2)
+	expectStartChatAck(t, streamA, chatID)
+	sendStartChatRekey(t, streamA, chatID, appBID, mustEphemeral(t), appAPriv, 2)
+	frame := recvFrame(t, streamA)
+	if errBody, ok := frame.Body.(*approuterpb.AppFrame_Error); ok {
+		if errBody.Error.Code != "REKEY_THROTTLED" {
+			t.Fatalf("expected REKEY_THROTTLED, got %s", errBody.Error.Code)
+		}
+	} else {
+		t.Fatalf("expected error frame after throttled rekey, got %T", frame.Body)
+	}
+
+	sendStartChatRekey(t, streamB, chatID, appAID, ephB2, appBPriv, 2)
+	expectStartChatAck(t, streamB, chatID)
+	_ = waitForStartChatOrError(t, streamA)
+	_ = waitForStartChatOrError(t, streamB)
+	_ = waitForSecretVersion(t, nodeA.ks, chatID, 2)
+
+	payload := []byte("throttle-payload-1")
+	if err := streamA.Send(&approuterpb.AppFrame{
+		Body: &approuterpb.AppFrame_ChatMessage{
+			ChatMessage: &approuterpb.ChatMessage{
+				ChatId:   chatID,
+				Payload:  payload,
+				Sequence: 1,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("send chat message: %v", err)
+	}
+	expectChatAck(t, streamA, chatID, 1)
+	_ = waitForChatMessage(t, streamB)
+
+	sendStartChatRekey(t, streamA, chatID, appBID, mustEphemeral(t), appAPriv, 2)
+	frame = recvFrame(t, streamA)
+	if errBody, ok := frame.Body.(*approuterpb.AppFrame_Error); ok {
+		if errBody.Error.Code != "REPLAYED_KEY" {
+			t.Fatalf("expected REPLAYED_KEY after applied rekey, got %s", errBody.Error.Code)
+		}
+	} else {
+		t.Fatalf("expected error frame after replayed rekey, got %T", frame.Body)
+	}
+
+	if err := streamB.Send(&approuterpb.AppFrame{
+		Body: &approuterpb.AppFrame_ChatMessage{
+			ChatMessage: &approuterpb.ChatMessage{
+				ChatId:   chatID,
+				Payload:  []byte("throttle-payload-2"),
+				Sequence: 1,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("send receiver message: %v", err)
+	}
+	expectChatAck(t, streamB, chatID, 1)
+	_ = waitForChatMessage(t, streamA)
+
+	if err := streamA.Send(&approuterpb.AppFrame{
+		Body: &approuterpb.AppFrame_DeleteChat{
+			DeleteChat: &approuterpb.DeleteChat{ChatId: chatID, Reason: "done"},
+		},
+	}); err != nil {
+		t.Fatalf("send delete chat: %v", err)
+	}
+	expectDeleteAck(t, streamA, "deleted")
+	expectDeleteAck(t, streamB, "deleted_by_peer")
+}
+
+func TestCrossNodeResumeFromKeystore(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	t.Cleanup(cancel)
+
+	nodeA := startMeshTestNode(t, "node-a")
+	nodeB := startMeshTestNode(t, "node-b")
+	defer nodeA.stop()
+	defer nodeB.stop()
+
+	appAPub, appAPriv := mustKeypair(t)
+	appBPub, appBPriv := mustKeypair(t)
+	appAID := appIdentityKey(appAPub)
+	appBID := appIdentityKey(appBPub)
+
+	ephA := mustEphemeral(t)
+	ephB := mustEphemeral(t)
+
+	chatID := "cross-resume"
+	seedResumeRecordForLocal(t, nodeA.ks, chatID, appAPub, appBPub, ephA, ephB, 2, "hermes-chat-session", 2, 1)
+	seedResumeRecordForLocal(t, nodeB.ks, chatID, appBPub, appAPub, ephB, ephA, 2, "hermes-chat-session", 1, 2)
+
+	now := time.Now()
+	nodeA.store.MergeMembers([]mesh.Member{nodeB.member}, now)
+	nodeB.store.MergeMembers([]mesh.Member{nodeA.member}, now)
+
+	connA := dialClient(t, ctx, nodeA.addr)
+	connB := dialClient(t, ctx, nodeB.addr)
+	t.Cleanup(func() {
+		connA.Close()
+		connB.Close()
+	})
+
+	clientA := approuterpb.NewAppRouterClient(connA)
+	clientB := approuterpb.NewAppRouterClient(connB)
+
+	streamA, err := clientA.Open(ctx)
+	if err != nil {
+		t.Fatalf("open stream A: %v", err)
+	}
+	streamB, err := clientB.Open(ctx)
+	if err != nil {
+		t.Fatalf("open stream B: %v", err)
+	}
+
+	sendConnectFrame(t, streamA, nodeA.id, appAPub, appAPriv, nil)
+	sendConnectFrame(t, streamB, nodeB.id, appBPub, appBPriv, nil)
+	expectConnectAck(t, streamA)
+	expectConnectAck(t, streamB)
+
+	now = time.Now()
+	nodeA.store.MergeApps(nodeB.store.Apps(), now)
+	nodeB.store.MergeApps(nodeA.store.Apps(), now)
+
+	sendStartChatCustom(t, streamA, chatID, appBID, ephA, appAPriv, "hermes-chat-session", 2)
+	expectStartChatAck(t, streamA, chatID)
+	sendStartChatCustom(t, streamB, chatID, appAID, ephB, appBPriv, "hermes-chat-session", 2)
+	expectStartChatAck(t, streamB, chatID)
+
+	_ = waitForStartChatOrError(t, streamA)
+	_ = waitForStartChatOrError(t, streamB)
+
+	nextA := uint64(3)
+	nextB := uint64(2)
+
+	if err := streamA.Send(&approuterpb.AppFrame{
+		Body: &approuterpb.AppFrame_ChatMessage{
+			ChatMessage: &approuterpb.ChatMessage{
+				ChatId:   chatID,
+				Payload:  []byte("resume-payload-a"),
+				Sequence: nextA,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("send resume message A: %v", err)
+	}
+	expectChatAck(t, streamA, chatID, nextA)
+	msgB := waitForChatMessage(t, streamB)
+	if msgB.Sequence != nextA {
+		t.Fatalf("expected seq %d for receiver, got %d", nextA, msgB.Sequence)
+	}
+
+	if err := streamB.Send(&approuterpb.AppFrame{
+		Body: &approuterpb.AppFrame_ChatMessage{
+			ChatMessage: &approuterpb.ChatMessage{
+				ChatId:   chatID,
+				Payload:  []byte("resume-payload-b"),
+				Sequence: nextB,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("send resume message B: %v", err)
+	}
+	expectChatAck(t, streamB, chatID, nextB)
+	msgA := waitForChatMessage(t, streamA)
+	if msgA.Sequence != nextB {
+		t.Fatalf("expected seq %d for sender A, got %d", nextB, msgA.Sequence)
+	}
+
+	recA := waitForSecretVersion(t, nodeA.ks, chatID, 2)
+	recB := waitForSecretVersion(t, nodeB.ks, chatID, 2)
+	if recA.SendCount != 3 || recA.RecvCount != 2 {
+		t.Fatalf("unexpected counters on node A: send=%d recv=%d", recA.SendCount, recA.RecvCount)
+	}
+	if recB.SendCount != 2 || recB.RecvCount != 3 {
+		t.Fatalf("unexpected counters on node B: send=%d recv=%d", recB.SendCount, recB.RecvCount)
+	}
+
+	if err := streamA.Send(&approuterpb.AppFrame{
+		Body: &approuterpb.AppFrame_DeleteChat{
+			DeleteChat: &approuterpb.DeleteChat{ChatId: chatID, Reason: "resume-finished"},
+		},
+	}); err != nil {
+		t.Fatalf("send delete chat: %v", err)
+	}
+	expectDeleteAck(t, streamA, "deleted")
+	expectDeleteAck(t, streamB, "deleted_by_peer")
 }
 
 type meshTestNode struct {
@@ -332,4 +748,33 @@ func (n meshTestNode) stop() {
 	if n.stopFn != nil {
 		n.stopFn()
 	}
+}
+
+func waitForStartChatOrError(t *testing.T, stream approuterpb.AppRouter_OpenClient) *approuterpb.StartChat {
+	t.Helper()
+	for {
+		frame := recvFrame(t, stream)
+		switch body := frame.Body.(type) {
+		case *approuterpb.AppFrame_StartChat:
+			return body.StartChat
+		case *approuterpb.AppFrame_Error:
+			t.Fatalf("unexpected error while waiting for StartChat: %s %s", body.Error.Code, body.Error.Message)
+		}
+	}
+}
+
+func waitForSecretVersion(t *testing.T, ks *memoryKeystore, chatID string, version uint32) keystore.ChatSecretRecord {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if ks.has(chatID) {
+			rec, err := ks.LoadChatSecret(context.Background(), chatID)
+			if err == nil && rec.KeyVersion == version {
+				return rec
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("chat secret %s with version %d not found", chatID, version)
+	return keystore.ChatSecretRecord{}
 }

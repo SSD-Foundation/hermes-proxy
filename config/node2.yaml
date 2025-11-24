@@ -1,15 +1,17 @@
-grpc_address: "0.0.0.0:50051"
+grpc_address: "0.0.0.0:50052"
 log_level: "info"
-shutdown_grace_period: "10s"
+shutdown_grace_period: "5s"
 keystore:
   path: "data/keystore.json"
   passphrase_env: "HERMES_KEYSTORE_PASSPHRASE"
 mesh:
-  node_id: "hermes-dev"
-  public_address: "127.0.0.1:50051"
+  node_id: "hermes-node-2"
+  public_address: "node2:50052"
   identity_secret: "mesh_identity"
   wallet: ""
-  bootstrap_peers: []
+  bootstrap_peers:
+    - node_id: "hermes-node-1"
+      address: "node1:50051"
   tls:
     enabled: false
     cert_path: ""
@@ -20,7 +22,7 @@ mesh:
     dial_interval: "3s"
     heartbeat_interval: "15s"
 admin:
-  address: "0.0.0.0:8080"
+  address: "0.0.0.0:8081"
   read_header_timeout: "5s"
 cleanup:
   sweep_interval: "30s"
@@ -30,6 +32,8 @@ crypto:
   hkdf_hash: "sha256"
   hkdf_info_label: "hermes-chat-session"
   max_key_lifetime: "24h"
+  rekey_interval: "30s"
+  max_rekeys_per_chat: 3
 grpc_server:
   max_recv_msg_size: 4194304
   max_send_msg_size: 4194304

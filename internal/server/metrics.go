@@ -13,6 +13,10 @@ type routerMetrics struct {
 	frameErrors    *prometheus.CounterVec
 	frameLatency   *prometheus.HistogramVec
 	chatExpired    prometheus.Counter
+	ratchetAdvance *prometheus.CounterVec
+	ratchetFailure *prometheus.CounterVec
+	secretErase    *prometheus.CounterVec
+	rekeys         *prometheus.CounterVec
 }
 
 func newRouterMetrics(reg prometheus.Registerer) *routerMetrics {
@@ -46,6 +50,22 @@ func newRouterMetrics(reg prometheus.Registerer) *routerMetrics {
 			Name: "hermes_chats_expired_total",
 			Help: "Chats expired by housekeeping.",
 		}),
+		ratchetAdvance: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "hermes_ratchet_advances_total",
+			Help: "Ratchet advances per direction.",
+		}, []string{"direction"}),
+		ratchetFailure: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "hermes_ratchet_failures_total",
+			Help: "Ratchet failures by reason.",
+		}, []string{"reason"}),
+		secretErase: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "hermes_chat_erasures_total",
+			Help: "Chat secret erasures grouped by reason.",
+		}, []string{"reason"}),
+		rekeys: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "hermes_rekeys_total",
+			Help: "Rekey/resume events grouped by outcome.",
+		}, []string{"result"}),
 	}
 
 	reg.MustRegister(
@@ -55,6 +75,10 @@ func newRouterMetrics(reg prometheus.Registerer) *routerMetrics {
 		m.frameErrors,
 		m.frameLatency,
 		m.chatExpired,
+		m.ratchetAdvance,
+		m.ratchetFailure,
+		m.secretErase,
+		m.rekeys,
 	)
 	return m
 }
@@ -107,4 +131,44 @@ func (m *routerMetrics) recordChatExpiry() {
 		return
 	}
 	m.chatExpired.Inc()
+}
+
+func (m *routerMetrics) recordRatchetAdvance(direction string) {
+	if m == nil {
+		return
+	}
+	if direction == "" {
+		direction = "unknown"
+	}
+	m.ratchetAdvance.WithLabelValues(direction).Inc()
+}
+
+func (m *routerMetrics) recordRatchetFailure(reason string) {
+	if m == nil {
+		return
+	}
+	if reason == "" {
+		reason = "unknown"
+	}
+	m.ratchetFailure.WithLabelValues(reason).Inc()
+}
+
+func (m *routerMetrics) recordErasure(reason string) {
+	if m == nil {
+		return
+	}
+	if reason == "" {
+		reason = "unknown"
+	}
+	m.secretErase.WithLabelValues(reason).Inc()
+}
+
+func (m *routerMetrics) recordRekey(result string) {
+	if m == nil {
+		return
+	}
+	if result == "" {
+		result = "unknown"
+	}
+	m.rekeys.WithLabelValues(result).Inc()
 }

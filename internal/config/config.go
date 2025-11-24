@@ -19,6 +19,7 @@ type Config struct {
 	Admin               AdminConfig    `mapstructure:"admin"`
 	Cleanup             CleanupConfig  `mapstructure:"cleanup"`
 	GRPCServer          GRPCServer     `mapstructure:"grpc_server"`
+	Crypto              CryptoConfig   `mapstructure:"crypto"`
 }
 
 // KeystoreConfig describes how the keystore backend is initialized.
@@ -72,6 +73,15 @@ type CleanupConfig struct {
 	ChatIdleTimeout    time.Duration `mapstructure:"chat_idle_timeout"`
 }
 
+// CryptoConfig tunes HKDF parameters for per-chat key derivation.
+type CryptoConfig struct {
+	HKDFHash         string        `mapstructure:"hkdf_hash"`
+	HKDFInfoLabel    string        `mapstructure:"hkdf_info_label"`
+	MaxKeyLifetime   time.Duration `mapstructure:"max_key_lifetime"`
+	RekeyInterval    time.Duration `mapstructure:"rekey_interval"`
+	MaxRekeysPerChat int           `mapstructure:"max_rekeys_per_chat"`
+}
+
 // GRPCServer tunes keep-alives and message limits.
 type GRPCServer struct {
 	MaxRecvMsgSize    int           `mapstructure:"max_recv_msg_size"`
@@ -102,6 +112,13 @@ const (
 	defaultKeepaliveTime       = 2 * time.Minute
 	defaultKeepaliveTimeout    = 20 * time.Second
 	defaultMaxConnectionIdle   = time.Duration(0)
+	defaultHKDFHash            = "sha256"
+	defaultHKDFInfoLabel       = "hermes-chat-session"
+	defaultMaxKeyLifetime      = 24 * time.Hour
+	defaultRekeyInterval       = 30 * time.Second
+	defaultMaxRekeysPerChat    = 3
+	minKeyLifetime             = time.Minute
+	maxKeyLifetime             = 7 * 24 * time.Hour
 )
 
 // Load reads configuration from the provided file path (if any) and the environment.
@@ -132,6 +149,11 @@ func Load(path string) (Config, error) {
 	v.SetDefault("grpc_server.keepalive_time", defaultKeepaliveTime.String())
 	v.SetDefault("grpc_server.keepalive_timeout", defaultKeepaliveTimeout.String())
 	v.SetDefault("grpc_server.max_connection_idle", defaultMaxConnectionIdle.String())
+	v.SetDefault("crypto.hkdf_hash", defaultHKDFHash)
+	v.SetDefault("crypto.hkdf_info_label", defaultHKDFInfoLabel)
+	v.SetDefault("crypto.max_key_lifetime", defaultMaxKeyLifetime.String())
+	v.SetDefault("crypto.rekey_interval", defaultRekeyInterval.String())
+	v.SetDefault("crypto.max_rekeys_per_chat", defaultMaxRekeysPerChat)
 
 	if path != "" {
 		v.SetConfigFile(path)
@@ -169,6 +191,12 @@ func Load(path string) (Config, error) {
 		return Config{}, err
 	}
 	if cfg.GRPCServer.MaxConnectionIdle, err = durationFromConfig(v, "grpc_server.max_connection_idle", defaultMaxConnectionIdle); err != nil {
+		return Config{}, err
+	}
+	if cfg.Crypto.MaxKeyLifetime, err = durationFromConfig(v, "crypto.max_key_lifetime", defaultMaxKeyLifetime); err != nil {
+		return Config{}, err
+	}
+	if cfg.Crypto.RekeyInterval, err = durationFromConfig(v, "crypto.rekey_interval", defaultRekeyInterval); err != nil {
 		return Config{}, err
 	}
 	if cfg.Mesh.Gossip.DialInterval, err = durationFromConfig(v, "mesh.gossip.dial_interval", defaultMeshDialInterval); err != nil {
@@ -214,6 +242,23 @@ func Load(path string) (Config, error) {
 	if cfg.GRPCServer.MaxConnectionIdle == 0 {
 		cfg.GRPCServer.MaxConnectionIdle = cfg.Cleanup.SessionIdleTimeout
 	}
+	cfg.Crypto.HKDFHash = strings.ToLower(strings.TrimSpace(cfg.Crypto.HKDFHash))
+	if cfg.Crypto.HKDFHash == "" {
+		cfg.Crypto.HKDFHash = defaultHKDFHash
+	}
+	cfg.Crypto.HKDFInfoLabel = strings.TrimSpace(cfg.Crypto.HKDFInfoLabel)
+	if cfg.Crypto.HKDFInfoLabel == "" {
+		cfg.Crypto.HKDFInfoLabel = defaultHKDFInfoLabel
+	}
+	if cfg.Crypto.MaxKeyLifetime == 0 {
+		cfg.Crypto.MaxKeyLifetime = defaultMaxKeyLifetime
+	}
+	if cfg.Crypto.RekeyInterval == 0 {
+		cfg.Crypto.RekeyInterval = defaultRekeyInterval
+	}
+	if cfg.Crypto.MaxRekeysPerChat == 0 {
+		cfg.Crypto.MaxRekeysPerChat = defaultMaxRekeysPerChat
+	}
 	if cfg.Keystore.PassphraseEnv == "" {
 		cfg.Keystore.PassphraseEnv = defaultPassphraseEnv
 	}
@@ -236,6 +281,10 @@ func Load(path string) (Config, error) {
 		cfg.Mesh.Gossip.HeartbeatInterval = defaultMeshHeartbeat
 	}
 
+	if err := validateCryptoConfig(cfg.Crypto); err != nil {
+		return Config{}, err
+	}
+
 	return cfg, nil
 }
 
@@ -248,6 +297,33 @@ func durationFromConfig(v *viper.Viper, key string, fallback time.Duration) (tim
 		return dur, nil
 	}
 	return fallback, nil
+}
+
+func validateCryptoConfig(c CryptoConfig) error {
+	switch c.HKDFHash {
+	case "sha256", "sha512":
+	default:
+		return fmt.Errorf("crypto.hkdf_hash must be sha256 or sha512")
+	}
+	if c.MaxKeyLifetime <= 0 {
+		return fmt.Errorf("crypto.max_key_lifetime must be positive")
+	}
+	if c.MaxKeyLifetime < minKeyLifetime || c.MaxKeyLifetime > maxKeyLifetime {
+		return fmt.Errorf("crypto.max_key_lifetime must be between %s and %s", minKeyLifetime, maxKeyLifetime)
+	}
+	if c.HKDFInfoLabel == "" {
+		return fmt.Errorf("crypto.hkdf_info_label must be set")
+	}
+	if len(c.HKDFInfoLabel) > 128 {
+		return fmt.Errorf("crypto.hkdf_info_label exceeds 128 characters")
+	}
+	if c.RekeyInterval <= 0 {
+		return fmt.Errorf("crypto.rekey_interval must be positive")
+	}
+	if c.MaxRekeysPerChat <= 0 {
+		return fmt.Errorf("crypto.max_rekeys_per_chat must be positive")
+	}
+	return nil
 }
 
 // Passphrase fetches the keystore passphrase from the configured environment variable.

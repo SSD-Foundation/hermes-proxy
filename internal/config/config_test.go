@@ -43,6 +43,21 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Mesh.Gossip.HeartbeatInterval != defaultMeshHeartbeat {
 		t.Fatalf("expected default heartbeat %s, got %s", defaultMeshHeartbeat, cfg.Mesh.Gossip.HeartbeatInterval)
 	}
+	if cfg.Crypto.HKDFHash != defaultHKDFHash {
+		t.Fatalf("expected default hkdf hash %s, got %s", defaultHKDFHash, cfg.Crypto.HKDFHash)
+	}
+	if cfg.Crypto.HKDFInfoLabel != defaultHKDFInfoLabel {
+		t.Fatalf("expected default hkdf info label %s, got %s", defaultHKDFInfoLabel, cfg.Crypto.HKDFInfoLabel)
+	}
+	if cfg.Crypto.MaxKeyLifetime != defaultMaxKeyLifetime {
+		t.Fatalf("expected default max key lifetime %s, got %s", defaultMaxKeyLifetime, cfg.Crypto.MaxKeyLifetime)
+	}
+	if cfg.Crypto.RekeyInterval != defaultRekeyInterval {
+		t.Fatalf("expected default rekey interval %s, got %s", defaultRekeyInterval, cfg.Crypto.RekeyInterval)
+	}
+	if cfg.Crypto.MaxRekeysPerChat != defaultMaxRekeysPerChat {
+		t.Fatalf("expected default max rekeys per chat %d, got %d", defaultMaxRekeysPerChat, cfg.Crypto.MaxRekeysPerChat)
+	}
 }
 
 func TestLoadWithFileAndEnvOverride(t *testing.T) {
@@ -65,6 +80,12 @@ mesh:
   gossip:
     dial_interval: "1s"
     heartbeat_interval: "2s"
+crypto:
+  hkdf_hash: "sha512"
+  hkdf_info_label: "custom-info"
+  max_key_lifetime: "36h"
+  rekey_interval: "45s"
+  max_rekeys_per_chat: 10
 `), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -109,6 +130,21 @@ mesh:
 	if cfg.Mesh.Gossip.HeartbeatInterval != 2*time.Second {
 		t.Fatalf("expected heartbeat interval 2s, got %s", cfg.Mesh.Gossip.HeartbeatInterval)
 	}
+	if cfg.Crypto.HKDFHash != "sha512" {
+		t.Fatalf("expected hkdf hash sha512, got %s", cfg.Crypto.HKDFHash)
+	}
+	if cfg.Crypto.HKDFInfoLabel != "custom-info" {
+		t.Fatalf("expected hkdf info label custom-info, got %s", cfg.Crypto.HKDFInfoLabel)
+	}
+	if cfg.Crypto.MaxKeyLifetime != 36*time.Hour {
+		t.Fatalf("expected max key lifetime 36h, got %s", cfg.Crypto.MaxKeyLifetime)
+	}
+	if cfg.Crypto.RekeyInterval != 45*time.Second {
+		t.Fatalf("expected rekey interval 45s, got %s", cfg.Crypto.RekeyInterval)
+	}
+	if cfg.Crypto.MaxRekeysPerChat != 10 {
+		t.Fatalf("expected max rekeys per chat 10, got %d", cfg.Crypto.MaxRekeysPerChat)
+	}
 }
 
 func TestPassphraseFetch(t *testing.T) {
@@ -132,5 +168,62 @@ func TestPassphraseFetch(t *testing.T) {
 	cfg.Keystore.PassphraseEnv = "MISSING_ENV"
 	if _, err := cfg.Passphrase(); err == nil {
 		t.Fatal("expected error when passphrase env is missing")
+	}
+}
+
+func TestCryptoValidation(t *testing.T) {
+	if err := validateCryptoConfig(CryptoConfig{
+		HKDFHash:         "md5",
+		HKDFInfoLabel:    "ok",
+		MaxKeyLifetime:   time.Hour,
+		RekeyInterval:    time.Second,
+		MaxRekeysPerChat: 1,
+	}); err == nil {
+		t.Fatal("expected invalid hash error")
+	}
+	if err := validateCryptoConfig(CryptoConfig{
+		HKDFHash:         "sha256",
+		HKDFInfoLabel:    "",
+		MaxKeyLifetime:   time.Hour,
+		RekeyInterval:    time.Second,
+		MaxRekeysPerChat: 1,
+	}); err == nil {
+		t.Fatal("expected info label error")
+	}
+	if err := validateCryptoConfig(CryptoConfig{
+		HKDFHash:         "sha256",
+		HKDFInfoLabel:    "ok",
+		MaxKeyLifetime:   10 * time.Second,
+		RekeyInterval:    time.Second,
+		MaxRekeysPerChat: 1,
+	}); err == nil {
+		t.Fatal("expected max key lifetime bounds error")
+	}
+	if err := validateCryptoConfig(CryptoConfig{
+		HKDFHash:         "sha256",
+		HKDFInfoLabel:    "ok",
+		MaxKeyLifetime:   time.Hour,
+		RekeyInterval:    time.Second,
+		MaxRekeysPerChat: 1,
+	}); err != nil {
+		t.Fatalf("expected valid crypto config, got %v", err)
+	}
+	if err := validateCryptoConfig(CryptoConfig{
+		HKDFHash:         "sha256",
+		HKDFInfoLabel:    "ok",
+		MaxKeyLifetime:   time.Hour,
+		RekeyInterval:    -1,
+		MaxRekeysPerChat: 1,
+	}); err == nil {
+		t.Fatal("expected rekey interval error")
+	}
+	if err := validateCryptoConfig(CryptoConfig{
+		HKDFHash:         "sha256",
+		HKDFInfoLabel:    "ok",
+		MaxKeyLifetime:   time.Hour,
+		RekeyInterval:    time.Second,
+		MaxRekeysPerChat: 0,
+	}); err == nil {
+		t.Fatal("expected max rekeys error")
 	}
 }

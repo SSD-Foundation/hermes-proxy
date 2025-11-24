@@ -1,0 +1,120 @@
+services:
+  node1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hermes-node:dev
+    environment:
+      - HERMES_KEYSTORE_PASSPHRASE=compose-passphrase
+    command: ["--config", "/app/config/node1.yaml"]
+    volumes:
+      - node1-data:/app/data
+      - ./config/node1.yaml:/app/config/node1.yaml:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  node2:
+    image: hermes-node:dev
+    environment:
+      - HERMES_KEYSTORE_PASSPHRASE=compose-passphrase
+    command: ["--config", "/app/config/node2.yaml"]
+    volumes:
+      - node2-data:/app/data
+      - ./config/node2.yaml:/app/config/node2.yaml:ro
+    depends_on:
+      node1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  app-sender:
+    image: hermes-node:dev
+    depends_on:
+      node1:
+        condition: service_healthy
+      node2:
+        condition: service_healthy
+    entrypoint: ["/usr/local/bin/mockapp"]
+    command:
+      [
+        "--node",
+        "node1:50051",
+        "--node-id",
+        "hermes-node-1",
+        "--chat-id",
+        "mesh-restart-chat",
+        "--role",
+        "sender",
+        "--payload",
+        "integration-payload-0123456789",
+        "--identity-seed",
+        "mesh-sender",
+        "--peer-seed",
+        "mesh-receiver",
+        "--target-node",
+        "hermes-node-2",
+        "--start-delay",
+        "5s",
+        "--rekey-version",
+        "2",
+        "--messages",
+        "1",
+        "--post-restart-messages",
+        "1",
+        "--expect-restart",
+        "--max-restarts",
+        "5",
+        "--timeout",
+        "90s",
+      ]
+
+  app-receiver:
+    image: hermes-node:dev
+    depends_on:
+      node1:
+        condition: service_healthy
+      node2:
+        condition: service_healthy
+    entrypoint: ["/usr/local/bin/mockapp"]
+    command:
+      [
+        "--node",
+        "node2:50052",
+        "--node-id",
+        "hermes-node-2",
+        "--chat-id",
+        "mesh-restart-chat",
+        "--role",
+        "receiver",
+        "--payload",
+        "integration-payload-0123456789",
+        "--identity-seed",
+        "mesh-receiver",
+        "--peer-seed",
+        "mesh-sender",
+        "--target-node",
+        "hermes-node-1",
+        "--start-delay",
+        "5s",
+        "--rekey-version",
+        "2",
+        "--messages",
+        "1",
+        "--post-restart-messages",
+        "1",
+        "--expect-restart",
+        "--max-restarts",
+        "5",
+        "--timeout",
+        "90s",
+      ]
+
+volumes:
+  node1-data:
+  node2-data:

@@ -76,7 +76,6 @@ func (s *NodeServer) Start(ctx context.Context) error {
 	if err := s.initMesh(ctx); err != nil {
 		return err
 	}
-	s.startAdminServer(reg)
 
 	grpcOpts := []grpc.ServerOption{
 		grpc.KeepaliveParams(keepalive.ServerParameters{
@@ -107,6 +106,11 @@ func (s *NodeServer) Start(ctx context.Context) error {
 		NodeID:               s.cfg.Mesh.NodeID,
 		Apps:                 s.apps,
 		MeshStore:            s.meshStore,
+		HKDFHash:             s.cfg.Crypto.HKDFHash,
+		HKDFInfo:             s.cfg.Crypto.HKDFInfoLabel,
+		MaxKeyLifetime:       s.cfg.Crypto.MaxKeyLifetime,
+		MaxRekeysPerChat:     s.cfg.Crypto.MaxRekeysPerChat,
+		RekeyInterval:        s.cfg.Crypto.RekeyInterval,
 	})
 	s.router = router
 
@@ -127,6 +131,8 @@ func (s *NodeServer) Start(ctx context.Context) error {
 	if s.meshSvc != nil {
 		s.meshSvc.AttachRouter(router)
 	}
+
+	s.startAdminServer(reg)
 
 	router.StartHousekeeping(ctx)
 	approuterpb.RegisterAppRouterServer(s.grpcServer, router)
@@ -272,6 +278,15 @@ func (s *NodeServer) startAdminServer(reg *prometheus.Registry) {
 			w.Header().Set("Content-Type", "application/json")
 			if err := json.NewEncoder(w).Encode(payload); err != nil {
 				s.log.Warn("encode mesh membership", zap.Error(err))
+			}
+		})
+	}
+	if s.router != nil {
+		mux.HandleFunc("/crypto/ratchets", func(w http.ResponseWriter, _ *http.Request) {
+			payload := s.router.snapshotRatchets()
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(payload); err != nil {
+				s.log.Warn("encode ratchet status", zap.Error(err))
 			}
 		})
 	}

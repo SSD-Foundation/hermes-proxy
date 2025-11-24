@@ -39,7 +39,9 @@ func main() {
 		logger.Fatal("keystore passphrase unavailable", zap.Error(err))
 	}
 
-	keyBackend := keystore.NewFileBackend(cfg.Keystore.Path)
+	fileBackend := keystore.NewFileBackend(cfg.Keystore.Path)
+	fileBackend.MarkNonChatSecretIDs(cfg.Mesh.IdentitySecret)
+	var keyBackend keystore.KeyBackend = fileBackend
 	initOrUnlockKeystore(logger, keyBackend, passphrase)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
