@@ -1,0 +1,102 @@
+syntax = "proto3";
+
+package nodemesh.v1;
+
+option go_package = "github.com/hermes-proxy/hermes-proxy/pkg/api/nodemeshpb;nodemeshpb";
+
+// NodeMesh defines node↔node contracts for membership gossip and chat routing.
+service NodeMesh {
+  rpc Join(JoinRequest) returns (JoinResponse);
+  rpc Gossip(stream GossipMessage) returns (stream GossipMessage);
+  rpc RouteChat(stream RouteFrame) returns (stream RouteFrame);
+}
+
+message NodeDescriptor {
+  string node_id = 1;
+  string endpoint = 2;
+  bytes identity_key = 3;
+  string wallet = 4;
+  map<string, string> metadata = 5;
+}
+
+message AppRegistration {
+  string app_id = 1;
+  string node_id = 2;
+  string session_id = 3;
+  map<string, string> metadata = 4;
+  int64 connected_at_nanos = 5;
+}
+
+message JoinRequest {
+  NodeDescriptor node = 1;
+  bytes nonce = 2;
+  bytes signature = 3;
+  repeated AppRegistration apps = 4;
+}
+
+message JoinResponse {
+  NodeDescriptor self = 1;
+  repeated NodeDescriptor membership = 2;
+  repeated AppRegistration apps = 3;
+}
+
+message GossipMessage {
+  oneof body {
+    Heartbeat heartbeat = 1;
+    MembershipEvent membership = 2;
+    AppSync app_sync = 3;
+  }
+}
+
+message Heartbeat {
+  NodeDescriptor node = 1;
+  int64 timestamp_nanos = 2;
+}
+
+message MembershipEvent {
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    TYPE_JOIN = 1;
+    TYPE_LEAVE = 2;
+    TYPE_FAIL = 3;
+  }
+  Type type = 1;
+  NodeDescriptor node = 2;
+}
+
+message AppSync {
+  string node_id = 1;
+  repeated AppRegistration apps = 2;
+}
+
+message RouteFrame {
+  string correlation_id = 1;
+  oneof body {
+    SetupTieline setup_tieline = 2;
+    RelayMessage relay_message = 3;
+    TeardownTieline teardown_tieline = 4;
+    RouteError error = 5;
+  }
+}
+
+message SetupTieline {
+  string chat_id = 1;
+  string target_app_id = 2;
+  bytes payload = 3;
+}
+
+message RelayMessage {
+  string chat_id = 1;
+  bytes payload = 2;
+  uint64 sequence = 3;
+}
+
+message TeardownTieline {
+  string chat_id = 1;
+  string reason = 2;
+}
+
+message RouteError {
+  string code = 1;
+  string message = 2;
+}

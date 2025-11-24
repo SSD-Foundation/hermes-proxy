@@ -1,23 +1,23 @@
-# HERMES Nodes (Phase 1 delivered; Phase 2 planning)
+# HERMES Nodes (Phase 2 – mesh bootstrap)
 
-This repository tracks the HERMES router nodes. Phase 1 delivers a gRPC-based service that connects Apps, manages encrypted 1:1 chats on a single node, and prepares the groundwork for the mesh, payments, and NAT features that follow. Platform target is Ubuntu Linux. Phase 2 planning (multi-node mesh and discovery) lives under `docs/plan/phase-2/`.
+This repository tracks the HERMES router nodes. Phase 1 delivers a gRPC-based service that connects Apps, manages encrypted 1:1 chats on a single node, and prepares the groundwork for the mesh, payments, and NAT features that follow. Phase 2 (in progress) layers NodeMesh membership, peer discovery, and cross-node routing on top of the existing chat plumbing. Platform target is Ubuntu Linux; the Phase 2 plan lives under `docs/plan/phase-2/`.
 
 ## Getting started
 - Read the MVP scope in `docs/hermes-mvp-revised.md`.
 - Review the Phase 1 plan and iteration prompts in `docs/plan/phase-1/` and the Phase 2 plan in `docs/plan/phase-2/`.
-- The gRPC contract lives in `proto/app_router.proto` with generated Go stubs in `pkg/api/approuterpb`.
-- The node binary entrypoint is `cmd/node` and hosts the `AppRouter.Open` bidirectional stream for connect/start chat/send/delete flows.
+- The gRPC contracts live in `proto/app_router.proto` and `proto/nodemesh.proto` with generated Go stubs in `pkg/api/approuterpb` and `pkg/api/nodemeshpb`.
+- The node binary entrypoint is `cmd/node` and hosts both `AppRouter.Open` (app connect/start chat/send/delete) and the new `NodeMesh` service for join/gossip/route envelopes.
 
 ## Development workflow
 - Install Go 1.24+ and ensure `protoc` with the Go plugins is available if regenerating protobufs.
-- Set `HERMES_KEYSTORE_PASSPHRASE` (or another env set in config) so the keystore backend can initialize/unlock.
+- Set `HERMES_KEYSTORE_PASSPHRASE` (or another env set in config) so the keystore backend can initialize/unlock node identity + chat secrets.
 - Common tasks:
   - `make fmt` – format the Go sources.
   - `make lint` – run `go vet`.
-  - `make test` – run unit + component tests (in-process gRPC chat flow).
+  - `make test` – run unit + component tests (AppRouter flows + NodeMesh join/membership).
   - `make build` – build all packages.
   - `make integration` – build the Docker image and run the Compose harness (node + two mock apps).
-  - `make proto` – regenerate gRPC stubs from `proto/app_router.proto`.
+  - `make proto` – regenerate gRPC stubs from `proto/app_router.proto` and `proto/nodemesh.proto`.
   - `go test ./internal/server` – component tests for connect/start chat/send/delete happy path and signature failure.
 
 ## Running the node
@@ -28,7 +28,7 @@ export HERMES_KEYSTORE_PASSPHRASE=change-me
 go run ./cmd/node --config config/dev.yaml
 ```
 
-If the keystore file does not exist, it is initialized automatically at the configured path. A small admin HTTP server (default `:8080`) serves `GET /healthz`, `GET /readyz`, and Prometheus metrics at `GET /metrics` for container readiness.
+If the keystore file does not exist, it is initialized automatically at the configured path. A small admin HTTP server (default `:8080`) serves `GET /healthz`, `GET /readyz`, Prometheus metrics at `GET /metrics`, and a membership dump at `GET /mesh/members` for mesh debugging.
 
 ## Configuration
 Configuration is read from a file plus environment overrides (`HERMES_` prefix). Example:
@@ -40,6 +40,21 @@ shutdown_grace_period: "10s"
 keystore:
   path: "data/keystore.json"
   passphrase_env: "HERMES_KEYSTORE_PASSPHRASE"
+mesh:
+  node_id: "hermes-dev"
+  public_address: "127.0.0.1:50051" # what other nodes should dial
+  identity_secret: "mesh_identity"   # keystore key used for node identity
+  wallet: ""                         # placeholder until staking/payments land
+  bootstrap_peers: []
+  tls:
+    enabled: false
+    cert_path: ""
+    key_path: ""
+    ca_path: ""
+    insecure_skip_verify: false
+  gossip:
+    dial_interval: "3s"
+    heartbeat_interval: "15s"
 admin:
   address: "0.0.0.0:8080"
   read_header_timeout: "5s"
@@ -55,6 +70,12 @@ grpc_server:
   max_connection_idle: "0s" # 0 defers to cleanup.session_idle_timeout
 ```
 
+## Mesh bootstrap
+- Node identity (ed25519) is stored in the sealed keystore under `mesh.identity_secret` and advertised during `NodeMesh.Join` alongside the node ID, wallet placeholder, and public endpoint.
+- Bootstrap peers are configured under `mesh.bootstrap_peers`; the dialer signs Join requests, validates peer signatures, merges membership snapshots, and opens a heartbeat `Gossip` stream with backoff.
+- Connected apps are registered in an in-memory discovery map keyed by app identity for future cross-node routing; the map is shared with peers during Join/AppSync.
+- TLS between nodes is configurable under `mesh.tls` (disabled by default for dev/test); when enabled the gRPC server uses the provided cert/key and optional CA for peer auth.
+
 ## Docker & integration harness
 - `docker-compose.dev.yaml` builds/runs the node plus two `mockapp` clients that exercise the happy-path chat flow. Run `make integration` to build the image, start the stack, wait for both apps to exit, and tear everything down.
 - The image produced by `Dockerfile` contains both binaries (`node` and `mockapp`), listens on `50051` for gRPC and `8080` for health/metrics, and persists the keystore to `/app/data` (Compose mounts a named volume).
@@ -64,10 +85,12 @@ grpc_server:
 - `cmd/node`: Node entrypoint wiring config, logging, keystore, registry, and gRPC server.
 - `cmd/mockapp`: Lightweight integration client used by the Compose harness.
 - `proto/app_router.proto`: AppRouter protobuf contract; generated code in `pkg/api/approuterpb`.
+- `proto/nodemesh.proto`: NodeMesh protobuf contract (Join/Gossip/RouteChat envelopes); generated code in `pkg/api/nodemeshpb`.
 - `internal/config`: Config loader with env overrides and server tuning defaults.
 - `internal/keystore`: Argon2id-derived file backend (sealed storage with tamper detection) with tests.
-- `internal/registry`: In-memory chat/tieline registry.
-- `internal/server`: gRPC server wiring and `AppRouter` implementation (connect handshake, chat routing, teardown, metrics, housekeeping).
+- `internal/registry`: In-memory chat/tieline registry and app presence map.
+- `internal/mesh`: NodeMesh membership store, gRPC server, and bootstrap dialer.
+- `internal/server`: gRPC server wiring, `AppRouter` implementation (connect handshake, chat routing, teardown, metrics, housekeeping), NodeMesh service, and admin endpoints.
 - `docs/hermes-mvp-revised.md`: Revised MVP specification.
 - `docs/plan/phase-1/`: Implementation plan and iteration prompts for the delivered single-node scope.
 - `docs/plan/phase-2/`: Implementation plan and iteration prompts for the mesh/discovery scope.

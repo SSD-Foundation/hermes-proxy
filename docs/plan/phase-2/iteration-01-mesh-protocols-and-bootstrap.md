@@ -21,3 +21,9 @@ Define the NodeMesh contracts and land the initial join/bootstrap path so nodes 
 - A node can start with a bootstrap peer list, dial at least one peer, authenticate it, and populate membership state; peers accept and record joins.
 - Connected apps are registered in a discovery map keyed by app identity for future routing.
 - Metrics/logs expose membership counts and join outcomes; component tests cover the bootstrap/join path and membership merge behavior.
+
+## Status update (2025-11-23)
+- Added `proto/nodemesh.proto` + generated Go stubs; NodeMesh service validates signed Join requests, merges membership snapshots, syncs app presence, and exposes `/mesh/members` for debugging.
+- Membership store tracks node descriptors (endpoint, identity key, wallet placeholder, last heartbeat) and app presence keyed by identity. Bootstrap dialer signs Join payloads with the node keystore identity, retries with backoff, and maintains heartbeat Gossip streams.
+- AppRouter now records connected apps in an in-memory discovery map; the dialer and Join handler share that map with peers. Mesh metrics track known nodes, join success/failure, heartbeats, and app sync frames.
+- TLS hooks exist for node↔node gRPC (disabled by default in dev); config grew `mesh.*` fields for identity secret, public endpoint, bootstrap peers, and TLS materials. Unit/component tests cover membership merge logic and Join success/failure.

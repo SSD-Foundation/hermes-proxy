@@ -32,6 +32,8 @@ type RouterOptions struct {
 	SessionIdleTimeout   time.Duration
 	ChatIdleTimeout      time.Duration
 	HousekeepingInterval time.Duration
+	NodeID               string
+	Apps                 registry.AppRegistry
 }
 
 // AppRouterService implements the gRPC AppRouter contract.
@@ -45,6 +47,9 @@ type AppRouterService struct {
 	sessions  map[string]*appSession
 	chats     map[string]*tieline
 	houseOnce sync.Once
+
+	nodeID string
+	apps   registry.AppRegistry
 
 	sessionIdleTimeout   time.Duration
 	chatIdleTimeout      time.Duration
@@ -66,6 +71,8 @@ func NewAppRouterService(log *zap.Logger, reg registry.ChatRegistry, ks keystore
 		sessionIdleTimeout:   opts.SessionIdleTimeout,
 		chatIdleTimeout:      opts.ChatIdleTimeout,
 		housekeepingInterval: opts.HousekeepingInterval,
+		nodeID:               opts.NodeID,
+		apps:                 opts.Apps,
 	}
 	if svc.sessionIdleTimeout <= 0 {
 		svc.sessionIdleTimeout = 5 * time.Minute
@@ -176,6 +183,9 @@ func (s *AppRouterService) handleConnect(parentCtx context.Context, connect *app
 	if len(connect.Signature) == 0 {
 		return nil, status.Error(codes.Unauthenticated, "connect signature required")
 	}
+	if s.nodeID != "" && connect.NodeId != "" && connect.NodeId != s.nodeID {
+		return nil, status.Error(codes.PermissionDenied, "connect target node mismatch")
+	}
 	payload := connectSignaturePayload(connect)
 	if !ed25519.Verify(ed25519.PublicKey(connect.AppPublicKey), payload, connect.Signature) {
 		return nil, status.Error(codes.Unauthenticated, "connect signature invalid")
@@ -197,12 +207,23 @@ func (s *AppRouterService) handleConnect(parentCtx context.Context, connect *app
 		cancel:       cancel,
 		connectedAt:  now,
 		lastSeen:     now,
+		appID:        appIdentityKey(connect.AppPublicKey),
 	}
 
 	s.mu.Lock()
 	s.sessions[sessionID] = session
 	s.mu.Unlock()
 	s.incSession()
+
+	if s.apps != nil {
+		_ = s.apps.Register(registry.AppPresence{
+			AppID:       session.appID,
+			NodeID:      s.nodeID,
+			SessionID:   sessionID,
+			Metadata:    connect.Metadata,
+			ConnectedAt: now,
+		})
+	}
 
 	s.log.Info("app connected", zap.String("session_id", sessionID), zap.Any("metadata", connect.Metadata))
 	return session, nil
@@ -484,6 +505,10 @@ func (s *AppRouterService) cleanupSession(session *appSession) {
 	close(session.sendCh)
 	s.mu.Unlock()
 
+	if s.apps != nil && session.appID != "" {
+		s.apps.Remove(session.appID)
+	}
+
 	s.decSession()
 	for _, chatID := range deletedChats {
 		_ = s.registry.Delete(chatID)
@@ -639,6 +664,10 @@ func zeroBytes(data []byte) {
 	}
 }
 
+func appIdentityKey(pub ed25519.PublicKey) string {
+	return hex.EncodeToString(pub)
+}
+
 func connectSignaturePayload(connect *approuterpb.Connect) []byte {
 	if connect == nil {
 		return nil
@@ -677,6 +706,7 @@ type appSession struct {
 	cancel       context.CancelFunc
 	connectedAt  time.Time
 	lastSeen     time.Time
+	appID        string
 }
 
 // chatParticipant wraps per-chat sender state.

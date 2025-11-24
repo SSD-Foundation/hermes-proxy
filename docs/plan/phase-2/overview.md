@@ -20,8 +20,9 @@ Deliver the Stage 2 MVP outcomes from `docs/hermes-mvp-revised.md` for **nodes o
 - Keep the AppRouter contract compatible but evolve it where needed to carry target app identity and mesh routing hints.
 - All traffic remains gRPC-based; TLS is required for node↔node and prepared for app↔node in a later hardening pass.
 
-## Current status (from Phase 1)
-- Single node routes chats between two connected apps over `AppRouter.Open`, validates ed25519 signatures, enforces sequence ordering, cleans up idle chats, and persists combined chat secrets to the keystore.
+## Current status (Phase 2 bootstrap)
+- Single node routes chats between two connected apps over `AppRouter.Open`, validates ed25519 signatures, enforces sequence ordering, cleans up idle chats, and persists combined chat secrets to the keystore. Connected apps are registered in an in-memory discovery map keyed by app identity.
+- NodeMesh proto and Go stubs exist; `Join` validates signed peer descriptors, merges membership snapshots, syncs app presence, and seeds the membership store. A bootstrap dialer signs Join requests to configured peers with backoff and maintains a heartbeat `Gossip` stream. Admin `/mesh/members` dumps membership/app state; mesh metrics track node counts, join success/failure, and heartbeats.
 - Dockerfile + Compose harness exercise the happy-path chat flow with two mock apps; CI runs lint, unit/component tests, and the Compose integration job.
 - Observability includes Prometheus metrics and `/healthz`/`/readyz`; AGENT guardrails enforce docs/release-note updates and test coverage expectations.
 

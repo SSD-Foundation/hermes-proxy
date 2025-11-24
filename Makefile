@@ -1,6 +1,6 @@
 GO ?= go
 PROTOC ?= protoc
-PROTO_SRC := proto/app_router.proto
+PROTO_SRC := proto/app_router.proto proto/nodemesh.proto
 
 .PHONY: all proto fmt lint test build check integration
 
