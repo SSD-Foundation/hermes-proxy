@@ -14,8 +14,10 @@ import (
 	"time"
 
 	"github.com/hermes-proxy/hermes-proxy/internal/keystore"
+	"github.com/hermes-proxy/hermes-proxy/internal/mesh"
 	"github.com/hermes-proxy/hermes-proxy/internal/registry"
 	"github.com/hermes-proxy/hermes-proxy/pkg/api/approuterpb"
+	"github.com/hermes-proxy/hermes-proxy/pkg/api/nodemeshpb"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -32,6 +34,10 @@ type RouterOptions struct {
 	SessionIdleTimeout   time.Duration
 	ChatIdleTimeout      time.Duration
 	HousekeepingInterval time.Duration
+	NodeID               string
+	Apps                 registry.AppRegistry
+	MeshStore            *mesh.Store
+	Routes               *mesh.RouteClientPool
 }
 
 // AppRouterService implements the gRPC AppRouter contract.
@@ -43,8 +49,14 @@ type AppRouterService struct {
 	metrics   *routerMetrics
 	mu        sync.Mutex
 	sessions  map[string]*appSession
+	byAppID   map[string]*appSession
 	chats     map[string]*tieline
 	houseOnce sync.Once
+
+	nodeID string
+	apps   registry.AppRegistry
+	store  *mesh.Store
+	routes *mesh.RouteClientPool
 
 	sessionIdleTimeout   time.Duration
 	chatIdleTimeout      time.Duration
@@ -53,6 +65,9 @@ type AppRouterService struct {
 
 // NewAppRouterService wires dependencies for the gRPC handler.
 func NewAppRouterService(log *zap.Logger, reg registry.ChatRegistry, ks keystore.KeyBackend, opts RouterOptions) *AppRouterService {
+	if log == nil {
+		log = zap.NewNop()
+	}
 	if reg == nil {
 		reg = registry.NewInMemory(0)
 	}
@@ -62,10 +77,15 @@ func NewAppRouterService(log *zap.Logger, reg registry.ChatRegistry, ks keystore
 		keystore:             ks,
 		metrics:              opts.Metrics,
 		sessions:             make(map[string]*appSession),
+		byAppID:              make(map[string]*appSession),
 		chats:                make(map[string]*tieline),
 		sessionIdleTimeout:   opts.SessionIdleTimeout,
 		chatIdleTimeout:      opts.ChatIdleTimeout,
 		housekeepingInterval: opts.HousekeepingInterval,
+		nodeID:               opts.NodeID,
+		apps:                 opts.Apps,
+		store:                opts.MeshStore,
+		routes:               opts.Routes,
 	}
 	if svc.sessionIdleTimeout <= 0 {
 		svc.sessionIdleTimeout = 5 * time.Minute
@@ -176,6 +196,9 @@ func (s *AppRouterService) handleConnect(parentCtx context.Context, connect *app
 	if len(connect.Signature) == 0 {
 		return nil, status.Error(codes.Unauthenticated, "connect signature required")
 	}
+	if s.nodeID != "" && connect.NodeId != "" && connect.NodeId != s.nodeID {
+		return nil, status.Error(codes.PermissionDenied, "connect target node mismatch")
+	}
 	payload := connectSignaturePayload(connect)
 	if !ed25519.Verify(ed25519.PublicKey(connect.AppPublicKey), payload, connect.Signature) {
 		return nil, status.Error(codes.Unauthenticated, "connect signature invalid")
@@ -197,12 +220,25 @@ func (s *AppRouterService) handleConnect(parentCtx context.Context, connect *app
 		cancel:       cancel,
 		connectedAt:  now,
 		lastSeen:     now,
+		appID:        appIdentityKey(connect.AppPublicKey),
 	}
 
 	s.mu.Lock()
 	s.sessions[sessionID] = session
+	s.byAppID[session.appID] = session
 	s.mu.Unlock()
 	s.incSession()
+
+	if s.apps != nil {
+		_ = s.apps.Register(registry.AppPresence{
+			AppID:       session.appID,
+			NodeID:      s.nodeID,
+			SessionID:   sessionID,
+			Metadata:    connect.Metadata,
+			ConnectedAt: now,
+		})
+		s.syncLocalApps(now)
+	}
 
 	s.log.Info("app connected", zap.String("session_id", sessionID), zap.Any("metadata", connect.Metadata))
 	return session, nil
@@ -219,6 +255,8 @@ func (s *AppRouterService) routeFrame(session *appSession, frame *approuterpb.Ap
 		return s.handleDeleteChat(session, body.DeleteChat)
 	case *approuterpb.AppFrame_Heartbeat:
 		return s.handleHeartbeat(session, body.Heartbeat)
+	case *approuterpb.AppFrame_FindApp:
+		return s.handleFindApp(session, body.FindApp)
 	case *approuterpb.AppFrame_Connect:
 		return &routeError{code: "INVALID_FRAME", msg: "connect already completed", fatal: true}
 	default:
@@ -230,6 +268,9 @@ func (s *AppRouterService) handleStartChat(session *appSession, start *approuter
 	if start == nil || start.ChatId == "" {
 		return &routeError{code: "INVALID_FRAME", msg: "chat id required"}
 	}
+	if start.TargetAppId == "" {
+		return &routeError{code: "INVALID_FRAME", msg: "target app id required"}
+	}
 	if len(start.PeerPublicEphemeralKey) == 0 {
 		return &routeError{code: "INVALID_FRAME", msg: "ephemeral key required"}
 	}
@@ -237,14 +278,23 @@ func (s *AppRouterService) handleStartChat(session *appSession, start *approuter
 		return &routeError{code: "AUTH_FAILED", msg: "start chat signature invalid"}
 	}
 
+	routeNode, localRoute, err := s.resolveRoute(start.TargetAppId, start.TargetNodeHint)
+	if err != nil {
+		return &routeError{code: "TARGET_NOT_FOUND", msg: err.Error()}
+	}
+
 	participant := &chatParticipant{
 		session:      session,
 		ephemeralKey: append([]byte(nil), start.PeerPublicEphemeralKey...),
+		appID:        session.appID,
 	}
 
 	var notifications []peerNotification
 	var combinedKeys [][]byte
+	var remoteReady bool
+	var remoteNode string
 
+	now := time.Now()
 	s.mu.Lock()
 	tl, ok := s.chats[start.ChatId]
 	if !ok {
@@ -252,10 +302,13 @@ func (s *AppRouterService) handleStartChat(session *appSession, start *approuter
 		s.chats[start.ChatId] = tl
 		_ = s.registry.Register(registry.ChatSession{
 			ChatID:    start.ChatId,
-			CreatedAt: time.Now(),
-			Metadata:  start.Metadata,
+			CreatedAt: now,
+			Metadata:  cloneMetadata(start.Metadata),
 		})
 		s.incChat()
+	}
+	if tl.metadata == nil && len(start.Metadata) > 0 {
+		tl.metadata = cloneMetadata(start.Metadata)
 	}
 
 	if err := tl.addParticipant(participant); err != nil {
@@ -264,21 +317,38 @@ func (s *AppRouterService) handleStartChat(session *appSession, start *approuter
 	}
 	tl.markActive()
 
-	if tl.ready() {
-		for sid, p := range tl.participants {
-			peer := tl.peer(sid)
-			if peer == nil {
-				continue
+	if localRoute {
+		if tl.readyLocal() {
+			for sid, p := range tl.participants {
+				peer := tl.peer(sid)
+				if peer == nil {
+					continue
+				}
+				notifications = append(notifications, peerNotification{
+					target:  p.session,
+					chatID:  tl.id,
+					peerKey: append([]byte(nil), peer.ephemeralKey...),
+				})
 			}
-			notifications = append(notifications, peerNotification{
-				target:  p.session,
-				chatID:  tl.id,
-				peerKey: append([]byte(nil), peer.ephemeralKey...),
-			})
+			combinedKeys = tl.combinedKeys()
 		}
-		for _, p := range tl.participants {
-			combinedKeys = append(combinedKeys, append([]byte(nil), p.ephemeralKey...))
+	} else {
+		remoteNode = routeNode
+		if tl.remote == nil {
+			tl.remote = &remotePeer{
+				nodeID:      routeNode,
+				appID:       start.TargetAppId,
+				pendingAcks: make(map[uint64]*appSession),
+			}
+		} else {
+			if tl.remote.pendingAcks == nil {
+				tl.remote.pendingAcks = make(map[uint64]*appSession)
+			}
+			if tl.remote.nodeID == "" {
+				tl.remote.nodeID = routeNode
+			}
 		}
+		remoteReady = tl.readyRemote()
 	}
 	s.mu.Unlock()
 
@@ -304,7 +374,76 @@ func (s *AppRouterService) handleStartChat(session *appSession, start *approuter
 		s.persistChatSecret(start.ChatId, combinedKeys)
 	}
 
+	if remoteReady {
+		s.notifyRemoteReady(start.ChatId)
+	}
+
+	if remoteNode != "" {
+		if err := s.sendRemoteSetup(remoteNode, session, start); err != nil {
+			return err
+		}
+	}
+
 	return nil
+}
+
+func (s *AppRouterService) sendRemoteSetup(nodeID string, session *appSession, start *approuterpb.StartChat) error {
+	if s.routes == nil {
+		return &routeError{code: "ROUTE_UNAVAILABLE", msg: "mesh routing not configured"}
+	}
+
+	frame := &nodemeshpb.RouteFrame{
+		CorrelationId: start.ChatId,
+		Body: &nodemeshpb.RouteFrame_SetupTieline{
+			SetupTieline: &nodemeshpb.SetupTieline{
+				ChatId:             start.ChatId,
+				SourceAppId:        session.appID,
+				TargetAppId:        start.TargetAppId,
+				SourceEphemeralKey: start.PeerPublicEphemeralKey,
+				Signature:          start.Signature,
+				Metadata:           cloneMetadata(start.Metadata),
+				SourceNodeId:       s.nodeID,
+				SourcePublicKey:    append([]byte(nil), session.appPublicKey...),
+			},
+		},
+	}
+
+	if err := s.routes.Send(context.Background(), nodeID, frame); err != nil {
+		return &routeError{code: "ROUTE_UNAVAILABLE", msg: fmt.Sprintf("route to node %s unavailable", nodeID)}
+	}
+	return nil
+}
+
+func (s *AppRouterService) notifyRemoteReady(chatID string) {
+	s.mu.Lock()
+	tl, ok := s.chats[chatID]
+	if !ok || !tl.readyRemote() || tl.remote == nil || tl.remote.startNotified {
+		s.mu.Unlock()
+		return
+	}
+	var local *chatParticipant
+	for _, p := range tl.participants {
+		local = p
+		break
+	}
+	if local == nil {
+		s.mu.Unlock()
+		return
+	}
+	peerKey := append([]byte(nil), tl.remote.ephemeralKey...)
+	tl.remote.startNotified = true
+	combined := tl.combinedKeys()
+	s.mu.Unlock()
+
+	_ = s.pushFrame(local.session, &approuterpb.AppFrame{
+		Body: &approuterpb.AppFrame_StartChat{
+			StartChat: &approuterpb.StartChat{
+				ChatId:                 chatID,
+				PeerPublicEphemeralKey: peerKey,
+			},
+		},
+	})
+	s.persistChatSecret(chatID, combined)
 }
 
 func (s *AppRouterService) handleChatMessage(session *appSession, msg *approuterpb.ChatMessage) error {
@@ -316,6 +455,7 @@ func (s *AppRouterService) handleChatMessage(session *appSession, msg *approuter
 	}
 
 	var peer *chatParticipant
+	var remote *remotePeer
 	expected := uint64(1)
 
 	s.mu.Lock()
@@ -331,8 +471,13 @@ func (s *AppRouterService) handleChatMessage(session *appSession, msg *approuter
 		return &routeError{code: "CHAT_NOT_FOUND", msg: "sender not registered in chat"}
 	}
 
-	peer = tl.peer(session.id)
-	if peer == nil {
+	if tl.remote != nil {
+		remote = tl.remote
+	} else {
+		peer = tl.peer(session.id)
+	}
+
+	if peer == nil && (remote == nil || !tl.readyRemote()) {
 		s.mu.Unlock()
 		return &routeError{code: "CHAT_NOT_READY", msg: "chat not ready"}
 	}
@@ -350,6 +495,18 @@ func (s *AppRouterService) handleChatMessage(session *appSession, msg *approuter
 
 	sender.nextSeq = msg.Sequence
 	tl.markActive()
+
+	if remote != nil {
+		if remote.pendingAcks == nil {
+			remote.pendingAcks = make(map[uint64]*appSession)
+		}
+		remote.pendingAcks[msg.Sequence] = session
+		nodeID := remote.nodeID
+		s.mu.Unlock()
+		return s.forwardToRemote(nodeID, tl.id, msg)
+	}
+
+	peerSession := peer.session
 	s.mu.Unlock()
 
 	if err := s.pushFrame(session, &approuterpb.AppFrame{
@@ -372,7 +529,49 @@ func (s *AppRouterService) handleChatMessage(session *appSession, msg *approuter
 			},
 		},
 	}
-	return s.pushFrame(peer.session, forward)
+	return s.pushFrame(peerSession, forward)
+}
+
+func (s *AppRouterService) forwardToRemote(nodeID, chatID string, msg *approuterpb.ChatMessage) error {
+	if nodeID == "" {
+		return &routeError{code: "ROUTE_UNAVAILABLE", msg: "remote node unknown"}
+	}
+	if s.routes == nil {
+		return &routeError{code: "ROUTE_UNAVAILABLE", msg: "mesh routing not configured"}
+	}
+
+	frame := &nodemeshpb.RouteFrame{
+		CorrelationId: chatID,
+		Body: &nodemeshpb.RouteFrame_RelayMessage{
+			RelayMessage: &nodemeshpb.RelayMessage{
+				ChatId:   chatID,
+				Payload:  append([]byte(nil), msg.Payload...),
+				Sequence: msg.Sequence,
+			},
+		},
+	}
+	if err := s.routes.Send(context.Background(), nodeID, frame); err != nil {
+		return &routeError{code: "ROUTE_UNAVAILABLE", msg: "failed to forward to remote"}
+	}
+	return nil
+}
+
+func (s *AppRouterService) sendRemoteTeardown(nodeID, chatID, reason string) {
+	if nodeID == "" || s.routes == nil {
+		return
+	}
+	frame := &nodemeshpb.RouteFrame{
+		CorrelationId: chatID,
+		Body: &nodemeshpb.RouteFrame_TeardownTieline{
+			TeardownTieline: &nodemeshpb.TeardownTieline{
+				ChatId: chatID,
+				Reason: reason,
+			},
+		},
+	}
+	if err := s.routes.Send(context.Background(), nodeID, frame); err != nil {
+		s.log.Warn("send remote teardown failed", zap.String("chat_id", chatID), zap.String("node_id", nodeID), zap.Error(err))
+	}
 }
 
 func (s *AppRouterService) handleDeleteChat(session *appSession, del *approuterpb.DeleteChat) error {
@@ -382,6 +581,7 @@ func (s *AppRouterService) handleDeleteChat(session *appSession, del *approuterp
 
 	var sessions []*appSession
 	var removed bool
+	var remoteNode string
 
 	s.mu.Lock()
 	if tl, ok := s.chats[del.ChatId]; ok {
@@ -389,13 +589,16 @@ func (s *AppRouterService) handleDeleteChat(session *appSession, del *approuterp
 		for _, p := range tl.participants {
 			sessions = append(sessions, p.session)
 		}
+		if tl.remote != nil {
+			remoteNode = tl.remote.nodeID
+		}
 		delete(s.chats, del.ChatId)
 		tl.wipeSecrets()
 		removed = true
 	}
 	s.mu.Unlock()
 
-	if len(sessions) == 0 {
+	if len(sessions) == 0 && remoteNode == "" {
 		return &routeError{code: "CHAT_NOT_FOUND", msg: "chat not found"}
 	}
 
@@ -403,6 +606,10 @@ func (s *AppRouterService) handleDeleteChat(session *appSession, del *approuterp
 		s.decChat()
 		_ = s.registry.Delete(del.ChatId)
 		s.eraseSecret(del.ChatId)
+	}
+
+	if remoteNode != "" {
+		s.sendRemoteTeardown(remoteNode, del.ChatId, "deleted_by_peer")
 	}
 
 	for _, target := range sessions {
@@ -423,6 +630,307 @@ func (s *AppRouterService) handleDeleteChat(session *appSession, del *approuterp
 	return nil
 }
 
+// HandleRouteFrame implements mesh.RouteHandler for inbound RouteChat frames.
+func (s *AppRouterService) HandleRouteFrame(ctx context.Context, fromNode string, frame *nodemeshpb.RouteFrame) (*nodemeshpb.RouteFrame, error) {
+	switch body := frame.Body.(type) {
+	case *nodemeshpb.RouteFrame_SetupTieline:
+		return s.handleRouteSetup(fromNode, body.SetupTieline)
+	case *nodemeshpb.RouteFrame_RelayMessage:
+		return s.handleRouteRelay(body.RelayMessage)
+	case *nodemeshpb.RouteFrame_RelayAck:
+		return s.handleRouteAck(body.RelayAck)
+	case *nodemeshpb.RouteFrame_TeardownTieline:
+		return s.handleRouteTeardown(body.TeardownTieline)
+	case *nodemeshpb.RouteFrame_Error:
+		return nil, s.handleRouteError(frame.GetCorrelationId(), body.Error)
+	default:
+		return nil, &mesh.RouteError{Code: "UNSUPPORTED", Msg: "unsupported route frame"}
+	}
+}
+
+// HandleRouteClosed tears down chats tied to a remote node on stream loss.
+func (s *AppRouterService) HandleRouteClosed(nodeID string) {
+	if nodeID == "" {
+		return
+	}
+	s.handleNodeLoss(nodeID, "route_closed")
+}
+
+func (s *AppRouterService) handleRouteSetup(fromNode string, setup *nodemeshpb.SetupTieline) (*nodemeshpb.RouteFrame, error) {
+	if setup == nil || setup.ChatId == "" {
+		return nil, &mesh.RouteError{Code: "INVALID_FRAME", Msg: "chat id required"}
+	}
+	if len(setup.SourceEphemeralKey) == 0 || len(setup.Signature) == 0 {
+		return nil, &mesh.RouteError{Code: "INVALID_FRAME", Msg: "ephemeral key and signature required"}
+	}
+	if len(setup.SourcePublicKey) != ed25519.PublicKeySize {
+		return nil, &mesh.RouteError{Code: "INVALID_FRAME", Msg: "source public key invalid"}
+	}
+
+	sourceID := appIdentityKey(ed25519.PublicKey(setup.SourcePublicKey))
+	if setup.SourceAppId != "" && setup.SourceAppId != sourceID {
+		return nil, &mesh.RouteError{Code: "AUTH_FAILED", Msg: "source app id mismatch"}
+	}
+	if !ed25519.Verify(ed25519.PublicKey(setup.SourcePublicKey), setup.SourceEphemeralKey, setup.Signature) {
+		return nil, &mesh.RouteError{Code: "AUTH_FAILED", Msg: "setup signature invalid"}
+	}
+
+	target := s.sessionByApp(setup.TargetAppId)
+	if target == nil {
+		return nil, &mesh.RouteError{Code: "TARGET_NOT_FOUND", Msg: "target app not connected"}
+	}
+
+	now := time.Now()
+	s.mu.Lock()
+	tl, ok := s.chats[setup.ChatId]
+	if !ok {
+		tl = newTieline(setup.ChatId)
+		tl.metadata = cloneMetadata(setup.Metadata)
+		s.chats[setup.ChatId] = tl
+		_ = s.registry.Register(registry.ChatSession{
+			ChatID:    setup.ChatId,
+			CreatedAt: now,
+			Metadata:  cloneMetadata(setup.Metadata),
+		})
+		s.incChat()
+	}
+	if tl.remote == nil {
+		tl.remote = &remotePeer{
+			nodeID:      fromNode,
+			appID:       sourceID,
+			pendingAcks: make(map[uint64]*appSession),
+		}
+	} else {
+		if tl.remote.pendingAcks == nil {
+			tl.remote.pendingAcks = make(map[uint64]*appSession)
+		}
+		if tl.remote.nodeID == "" {
+			tl.remote.nodeID = fromNode
+		}
+	}
+	tl.remote.ephemeralKey = append([]byte(nil), setup.SourceEphemeralKey...)
+	if tl.remote.appID == "" {
+		tl.remote.appID = sourceID
+	}
+	tl.markActive()
+	s.mu.Unlock()
+
+	s.notifyRemoteReady(setup.ChatId)
+	return nil, nil
+}
+
+func (s *AppRouterService) handleRouteRelay(relay *nodemeshpb.RelayMessage) (*nodemeshpb.RouteFrame, error) {
+	if relay == nil || relay.ChatId == "" {
+		return nil, &mesh.RouteError{Code: "INVALID_FRAME", Msg: "chat id required"}
+	}
+	if len(relay.Payload) < minCiphertextBytes {
+		return nil, &mesh.RouteError{Code: "INVALID_FRAME", Msg: "ciphertext envelope too small"}
+	}
+
+	var target *appSession
+	expected := uint64(1)
+
+	s.mu.Lock()
+	tl, ok := s.chats[relay.ChatId]
+	if !ok || tl.remote == nil {
+		s.mu.Unlock()
+		return nil, &mesh.RouteError{Code: "CHAT_NOT_FOUND", Msg: "chat not found"}
+	}
+	if tl.remote.inboundSeq > 0 {
+		expected = tl.remote.inboundSeq + 1
+	} else if relay.Sequence == 0 {
+		expected = 0
+	}
+	if relay.Sequence != expected {
+		s.mu.Unlock()
+		return nil, &mesh.RouteError{Code: "BAD_SEQUENCE", Msg: fmt.Sprintf("expected sequence %d", expected)}
+	}
+
+	for _, p := range tl.participants {
+		target = p.session
+		break
+	}
+	tl.remote.inboundSeq = relay.Sequence
+	tl.markActive()
+	s.mu.Unlock()
+
+	if target == nil {
+		return nil, &mesh.RouteError{Code: "CHAT_NOT_READY", Msg: "chat not ready"}
+	}
+
+	if err := s.pushFrame(target, &approuterpb.AppFrame{
+		Body: &approuterpb.AppFrame_ChatMessage{
+			ChatMessage: &approuterpb.ChatMessage{
+				ChatId:   relay.ChatId,
+				Payload:  append([]byte(nil), relay.Payload...),
+				Sequence: relay.Sequence,
+			},
+		},
+	}); err != nil {
+		return nil, err
+	}
+
+	return &nodemeshpb.RouteFrame{
+		CorrelationId: relay.ChatId,
+		Body: &nodemeshpb.RouteFrame_RelayAck{
+			RelayAck: &nodemeshpb.RelayAck{
+				ChatId:   relay.ChatId,
+				Sequence: relay.Sequence,
+			},
+		},
+	}, nil
+}
+
+func (s *AppRouterService) handleRouteAck(ack *nodemeshpb.RelayAck) (*nodemeshpb.RouteFrame, error) {
+	if ack == nil || ack.ChatId == "" {
+		return nil, &mesh.RouteError{Code: "INVALID_FRAME", Msg: "chat id required"}
+	}
+
+	var sender *appSession
+
+	s.mu.Lock()
+	if tl, ok := s.chats[ack.ChatId]; ok && tl.remote != nil {
+		if tl.remote.pendingAcks != nil {
+			sender = tl.remote.pendingAcks[ack.Sequence]
+			delete(tl.remote.pendingAcks, ack.Sequence)
+		}
+		tl.markActive()
+	}
+	s.mu.Unlock()
+
+	if sender == nil {
+		return nil, nil
+	}
+
+	_ = s.pushFrame(sender, &approuterpb.AppFrame{
+		Body: &approuterpb.AppFrame_ChatMessageAck{
+			ChatMessageAck: &approuterpb.ChatMessageAck{
+				ChatId:   ack.ChatId,
+				Sequence: ack.Sequence,
+			},
+		},
+	})
+	return nil, nil
+}
+
+func (s *AppRouterService) handleRouteTeardown(teardown *nodemeshpb.TeardownTieline) (*nodemeshpb.RouteFrame, error) {
+	if teardown == nil || teardown.ChatId == "" {
+		return nil, &mesh.RouteError{Code: "INVALID_FRAME", Msg: "chat id required"}
+	}
+
+	var sessions []*appSession
+	var removed bool
+
+	s.mu.Lock()
+	if tl, ok := s.chats[teardown.ChatId]; ok {
+		for _, p := range tl.participants {
+			sessions = append(sessions, p.session)
+		}
+		delete(s.chats, teardown.ChatId)
+		tl.wipeSecrets()
+		removed = true
+	}
+	s.mu.Unlock()
+
+	if removed {
+		s.decChat()
+		_ = s.registry.Delete(teardown.ChatId)
+		s.eraseSecret(teardown.ChatId)
+	}
+
+	for _, sess := range sessions {
+		status := "deleted_by_peer"
+		switch teardown.Reason {
+		case "expired", "route_closed", "route_unavailable":
+			status = teardown.Reason
+		case "session_closed":
+			status = "route_closed"
+		}
+		_ = s.pushFrame(sess, &approuterpb.AppFrame{
+			Body: &approuterpb.AppFrame_DeleteChatAck{
+				DeleteChatAck: &approuterpb.DeleteChatAck{
+					ChatId: teardown.ChatId,
+					Status: status,
+				},
+			},
+		})
+	}
+
+	return nil, nil
+}
+
+func (s *AppRouterService) handleRouteError(chatID string, rerr *nodemeshpb.RouteError) error {
+	if chatID == "" || rerr == nil {
+		return nil
+	}
+	var sessions []*appSession
+	var removed bool
+
+	s.mu.Lock()
+	if tl, ok := s.chats[chatID]; ok {
+		for _, p := range tl.participants {
+			sessions = append(sessions, p.session)
+		}
+		delete(s.chats, chatID)
+		tl.wipeSecrets()
+		removed = true
+	}
+	s.mu.Unlock()
+
+	if removed {
+		s.decChat()
+		_ = s.registry.Delete(chatID)
+		s.eraseSecret(chatID)
+	}
+
+	for _, sess := range sessions {
+		_ = s.pushFrame(sess, &approuterpb.AppFrame{
+			Body: &approuterpb.AppFrame_Error{
+				Error: &approuterpb.Error{Code: rerr.GetCode(), Message: rerr.GetMessage()},
+			},
+		})
+	}
+	return nil
+}
+
+func (s *AppRouterService) handleNodeLoss(nodeID, reason string) {
+	type removed struct {
+		id       string
+		sessions []*appSession
+	}
+	var chats []removed
+
+	s.mu.Lock()
+	for chatID, tl := range s.chats {
+		if tl.remote != nil && tl.remote.nodeID == nodeID {
+			participants := make([]*appSession, 0, len(tl.participants))
+			for _, p := range tl.participants {
+				participants = append(participants, p.session)
+			}
+			tl.wipeSecrets()
+			delete(s.chats, chatID)
+			chats = append(chats, removed{id: chatID, sessions: participants})
+		}
+	}
+	s.mu.Unlock()
+
+	for _, chat := range chats {
+		s.decChat()
+		_ = s.registry.Delete(chat.id)
+		s.eraseSecret(chat.id)
+		for _, sess := range chat.sessions {
+			_ = s.pushFrame(sess, &approuterpb.AppFrame{
+				Body: &approuterpb.AppFrame_DeleteChatAck{
+					DeleteChatAck: &approuterpb.DeleteChatAck{
+						ChatId: chat.id,
+						Status: reason,
+					},
+				},
+			})
+		}
+	}
+}
+
 func (s *AppRouterService) handleHeartbeat(session *appSession, hb *approuterpb.Heartbeat) error {
 	if hb == nil {
 		return nil
@@ -430,6 +938,32 @@ func (s *AppRouterService) handleHeartbeat(session *appSession, hb *approuterpb.
 	return s.pushFrame(session, &approuterpb.AppFrame{
 		Body: &approuterpb.AppFrame_Heartbeat{
 			Heartbeat: hb,
+		},
+	})
+}
+
+func (s *AppRouterService) handleFindApp(session *appSession, find *approuterpb.FindApp) error {
+	if find == nil || find.TargetAppId == "" {
+		return &routeError{code: "INVALID_FRAME", msg: "target app id required"}
+	}
+
+	nodeID, local, err := s.resolveRoute(find.TargetAppId, find.TargetNodeHint)
+	status := "unknown"
+	if err == nil && nodeID != "" {
+		if local {
+			status = "local"
+		} else {
+			status = "found"
+		}
+	}
+
+	return s.pushFrame(session, &approuterpb.AppFrame{
+		Body: &approuterpb.AppFrame_FindAppResult{
+			FindAppResult: &approuterpb.FindAppResult{
+				TargetAppId: find.TargetAppId,
+				NodeId:      nodeID,
+				Status:      status,
+			},
 		},
 	})
 }
@@ -467,28 +1001,45 @@ func (s *AppRouterService) pushFrame(session *appSession, frame *approuterpb.App
 func (s *AppRouterService) cleanupSession(session *appSession) {
 	session.cancel()
 
-	var deletedChats []string
+	type removed struct {
+		id         string
+		remoteNode string
+	}
+	var deletedChats []removed
 
 	s.mu.Lock()
 	delete(s.sessions, session.id)
+	delete(s.byAppID, session.appID)
 	for chatID, tl := range s.chats {
 		if _, ok := tl.participants[session.id]; ok {
 			tl.removeParticipant(session.id)
 			if tl.isEmpty() {
 				tl.wipeSecrets()
 				delete(s.chats, chatID)
-				deletedChats = append(deletedChats, chatID)
+				remoteNode := ""
+				if tl.remote != nil {
+					remoteNode = tl.remote.nodeID
+				}
+				deletedChats = append(deletedChats, removed{id: chatID, remoteNode: remoteNode})
 			}
 		}
 	}
 	close(session.sendCh)
 	s.mu.Unlock()
 
+	if s.apps != nil && session.appID != "" {
+		s.apps.Remove(session.appID)
+	}
+	s.syncLocalApps(time.Now())
+
 	s.decSession()
-	for _, chatID := range deletedChats {
-		_ = s.registry.Delete(chatID)
-		s.eraseSecret(chatID)
+	for _, chat := range deletedChats {
+		_ = s.registry.Delete(chat.id)
+		s.eraseSecret(chat.id)
 		s.decChat()
+		if chat.remoteNode != "" {
+			s.sendRemoteTeardown(chat.remoteNode, chat.id, "session_closed")
+		}
 	}
 
 	s.log.Info("app disconnected", zap.String("session_id", session.id))
@@ -520,8 +1071,9 @@ func (s *AppRouterService) expireIdleChats(now time.Time) {
 	}
 
 	type expiring struct {
-		id       string
-		sessions []*appSession
+		id         string
+		sessions   []*appSession
+		remoteNode string
 	}
 
 	var expired []expiring
@@ -535,7 +1087,11 @@ func (s *AppRouterService) expireIdleChats(now time.Time) {
 				sessions = append(sessions, p.session)
 			}
 			delete(s.chats, chatID)
-			expired = append(expired, expiring{id: chatID, sessions: sessions})
+			nodeID := ""
+			if tl.remote != nil {
+				nodeID = tl.remote.nodeID
+			}
+			expired = append(expired, expiring{id: chatID, sessions: sessions, remoteNode: nodeID})
 		}
 	}
 	s.mu.Unlock()
@@ -545,6 +1101,9 @@ func (s *AppRouterService) expireIdleChats(now time.Time) {
 		_ = s.registry.Delete(chat.id)
 		s.eraseSecret(chat.id)
 		s.recordChatExpiry()
+		if chat.remoteNode != "" {
+			s.sendRemoteTeardown(chat.remoteNode, chat.id, "expired")
+		}
 		for _, sess := range chat.sessions {
 			_ = s.pushFrame(sess, &approuterpb.AppFrame{
 				Body: &approuterpb.AppFrame_DeleteChatAck{
@@ -615,6 +1174,41 @@ func (s *AppRouterService) recordChatExpiry() {
 	s.metrics.recordChatExpiry()
 }
 
+func (s *AppRouterService) sessionByApp(appID string) *appSession {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.byAppID[appID]
+}
+
+func (s *AppRouterService) resolveRoute(targetAppID, hint string) (nodeID string, local bool, err error) {
+	if targetAppID == "" {
+		return "", false, errors.New("target app id required")
+	}
+	if sess := s.sessionByApp(targetAppID); sess != nil {
+		return s.nodeID, true, nil
+	}
+	if s.store != nil {
+		if app, ok := s.store.ResolveApp(targetAppID); ok {
+			return app.NodeID, app.NodeID == s.nodeID, nil
+		}
+	}
+	if hint != "" {
+		return hint, hint == s.nodeID, nil
+	}
+	// Fallback: assume local and wait for the peer to connect if discovery has not recorded the target yet.
+	return s.nodeID, true, nil
+}
+
+func (s *AppRouterService) syncLocalApps(now time.Time) {
+	if s.store == nil || s.apps == nil {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	s.store.SetLocalApps(s.apps.List(), now)
+}
+
 func metricOp(frame *approuterpb.AppFrame) string {
 	if frame == nil {
 		return "unknown"
@@ -628,6 +1222,8 @@ func metricOp(frame *approuterpb.AppFrame) string {
 		return "delete_chat"
 	case *approuterpb.AppFrame_Heartbeat:
 		return "heartbeat"
+	case *approuterpb.AppFrame_FindApp:
+		return "find_app"
 	default:
 		return "unknown"
 	}
@@ -637,6 +1233,21 @@ func zeroBytes(data []byte) {
 	for i := range data {
 		data[i] = 0
 	}
+}
+
+func cloneMetadata(m map[string]string) map[string]string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func appIdentityKey(pub ed25519.PublicKey) string {
+	return hex.EncodeToString(pub)
 }
 
 func connectSignaturePayload(connect *approuterpb.Connect) []byte {
@@ -677,6 +1288,7 @@ type appSession struct {
 	cancel       context.CancelFunc
 	connectedAt  time.Time
 	lastSeen     time.Time
+	appID        string
 }
 
 // chatParticipant wraps per-chat sender state.
@@ -684,6 +1296,7 @@ type chatParticipant struct {
 	session      *appSession
 	ephemeralKey []byte
 	nextSeq      uint64
+	appID        string
 }
 
 type peerNotification struct {
@@ -707,7 +1320,18 @@ func (e *routeError) Error() string {
 type tieline struct {
 	id           string
 	participants map[string]*chatParticipant
+	remote       *remotePeer
 	lastActivity time.Time
+	metadata     map[string]string
+}
+
+type remotePeer struct {
+	nodeID        string
+	appID         string
+	ephemeralKey  []byte
+	inboundSeq    uint64
+	pendingAcks   map[uint64]*appSession
+	startNotified bool
 }
 
 func newTieline(id string) *tieline {
@@ -724,6 +1348,11 @@ func (t *tieline) addParticipant(p *chatParticipant) error {
 	}
 	if _, ok := t.participants[p.session.id]; ok {
 		return errors.New("participant already registered")
+	}
+	for _, existing := range t.participants {
+		if existing.appID != "" && existing.appID == p.appID {
+			return errors.New("app already registered in chat")
+		}
 	}
 	t.participants[p.session.id] = p
 	return nil
@@ -745,8 +1374,16 @@ func (t *tieline) peer(sessionID string) *chatParticipant {
 	return nil
 }
 
-func (t *tieline) ready() bool {
+func (t *tieline) readyLocal() bool {
 	return len(t.participants) == 2
+}
+
+func (t *tieline) readyRemote() bool {
+	return len(t.participants) == 1 && t.remote != nil && len(t.remote.ephemeralKey) > 0
+}
+
+func (t *tieline) ready() bool {
+	return t.readyLocal() || t.readyRemote()
 }
 
 func (t *tieline) isEmpty() bool {
@@ -761,4 +1398,27 @@ func (t *tieline) wipeSecrets() {
 	for _, p := range t.participants {
 		zeroBytes(p.ephemeralKey)
 	}
+	if t.remote != nil {
+		zeroBytes(t.remote.ephemeralKey)
+	}
+}
+
+func (t *tieline) participantForApp(appID string) *chatParticipant {
+	for _, p := range t.participants {
+		if p.appID == appID {
+			return p
+		}
+	}
+	return nil
+}
+
+func (t *tieline) combinedKeys() [][]byte {
+	keys := make([][]byte, 0, len(t.participants)+1)
+	for _, p := range t.participants {
+		keys = append(keys, append([]byte(nil), p.ephemeralKey...))
+	}
+	if t.remote != nil && len(t.remote.ephemeralKey) > 0 {
+		keys = append(keys, append([]byte(nil), t.remote.ephemeralKey...))
+	}
+	return keys
 }

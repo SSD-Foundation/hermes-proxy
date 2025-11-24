@@ -15,6 +15,7 @@ type Config struct {
 	LogLevel            string         `mapstructure:"log_level"`
 	ShutdownGracePeriod time.Duration  `mapstructure:"shutdown_grace_period"`
 	Keystore            KeystoreConfig `mapstructure:"keystore"`
+	Mesh                MeshConfig     `mapstructure:"mesh"`
 	Admin               AdminConfig    `mapstructure:"admin"`
 	Cleanup             CleanupConfig  `mapstructure:"cleanup"`
 	GRPCServer          GRPCServer     `mapstructure:"grpc_server"`
@@ -24,6 +25,38 @@ type Config struct {
 type KeystoreConfig struct {
 	Path          string `mapstructure:"path"`
 	PassphraseEnv string `mapstructure:"passphrase_env"`
+}
+
+// MeshConfig describes node identity, bootstrap peers, and TLS for node-to-node traffic.
+type MeshConfig struct {
+	NodeID         string           `mapstructure:"node_id"`
+	PublicAddress  string           `mapstructure:"public_address"`
+	Wallet         string           `mapstructure:"wallet"`
+	IdentitySecret string           `mapstructure:"identity_secret"`
+	BootstrapPeers []MeshPeer       `mapstructure:"bootstrap_peers"`
+	TLS            MeshTLS          `mapstructure:"tls"`
+	Gossip         MeshGossipConfig `mapstructure:"gossip"`
+}
+
+// MeshPeer seeds bootstrap dialing to other nodes.
+type MeshPeer struct {
+	NodeID  string `mapstructure:"node_id"`
+	Address string `mapstructure:"address"`
+}
+
+// MeshTLS defines TLS materials for node↔node traffic.
+type MeshTLS struct {
+	Enabled            bool   `mapstructure:"enabled"`
+	CertPath           string `mapstructure:"cert_path"`
+	KeyPath            string `mapstructure:"key_path"`
+	CAPath             string `mapstructure:"ca_path"`
+	InsecureSkipVerify bool   `mapstructure:"insecure_skip_verify"`
+}
+
+// MeshGossipConfig tunes dial/heartbeat intervals for bootstrap + gossip streams.
+type MeshGossipConfig struct {
+	DialInterval      time.Duration `mapstructure:"dial_interval"`
+	HeartbeatInterval time.Duration `mapstructure:"heartbeat_interval"`
 }
 
 // AdminConfig controls the HTTP endpoints for health and metrics.
@@ -54,6 +87,11 @@ const (
 	defaultShutdownGracePeriod = 10 * time.Second
 	defaultPassphraseEnv       = "HERMES_KEYSTORE_PASSPHRASE"
 	defaultKeystorePath        = "data/keystore.json"
+	defaultMeshNodeID          = "hermes-dev"
+	defaultMeshPublicAddress   = "127.0.0.1:50051"
+	defaultMeshIdentitySecret  = "mesh_identity"
+	defaultMeshDialInterval    = 3 * time.Second
+	defaultMeshHeartbeat       = 15 * time.Second
 	defaultAdminAddress        = "0.0.0.0:8080"
 	defaultReadHeaderTimeout   = 5 * time.Second
 	defaultCleanupInterval     = time.Minute
@@ -79,6 +117,11 @@ func Load(path string) (Config, error) {
 	v.SetDefault("shutdown_grace_period", defaultShutdownGracePeriod.String())
 	v.SetDefault("keystore.path", defaultKeystorePath)
 	v.SetDefault("keystore.passphrase_env", defaultPassphraseEnv)
+	v.SetDefault("mesh.node_id", defaultMeshNodeID)
+	v.SetDefault("mesh.public_address", defaultMeshPublicAddress)
+	v.SetDefault("mesh.identity_secret", defaultMeshIdentitySecret)
+	v.SetDefault("mesh.gossip.dial_interval", defaultMeshDialInterval.String())
+	v.SetDefault("mesh.gossip.heartbeat_interval", defaultMeshHeartbeat.String())
 	v.SetDefault("admin.address", defaultAdminAddress)
 	v.SetDefault("admin.read_header_timeout", defaultReadHeaderTimeout.String())
 	v.SetDefault("cleanup.sweep_interval", defaultCleanupInterval.String())
@@ -128,6 +171,12 @@ func Load(path string) (Config, error) {
 	if cfg.GRPCServer.MaxConnectionIdle, err = durationFromConfig(v, "grpc_server.max_connection_idle", defaultMaxConnectionIdle); err != nil {
 		return Config{}, err
 	}
+	if cfg.Mesh.Gossip.DialInterval, err = durationFromConfig(v, "mesh.gossip.dial_interval", defaultMeshDialInterval); err != nil {
+		return Config{}, err
+	}
+	if cfg.Mesh.Gossip.HeartbeatInterval, err = durationFromConfig(v, "mesh.gossip.heartbeat_interval", defaultMeshHeartbeat); err != nil {
+		return Config{}, err
+	}
 
 	if cfg.GRPCAddress == "" {
 		cfg.GRPCAddress = defaultGRPCAddress
@@ -170,6 +219,21 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.Keystore.Path == "" {
 		cfg.Keystore.Path = defaultKeystorePath
+	}
+	if cfg.Mesh.NodeID == "" {
+		cfg.Mesh.NodeID = defaultMeshNodeID
+	}
+	if cfg.Mesh.PublicAddress == "" {
+		cfg.Mesh.PublicAddress = defaultMeshPublicAddress
+	}
+	if cfg.Mesh.IdentitySecret == "" {
+		cfg.Mesh.IdentitySecret = defaultMeshIdentitySecret
+	}
+	if cfg.Mesh.Gossip.DialInterval == 0 {
+		cfg.Mesh.Gossip.DialInterval = defaultMeshDialInterval
+	}
+	if cfg.Mesh.Gossip.HeartbeatInterval == 0 {
+		cfg.Mesh.Gossip.HeartbeatInterval = defaultMeshHeartbeat
 	}
 
 	return cfg, nil

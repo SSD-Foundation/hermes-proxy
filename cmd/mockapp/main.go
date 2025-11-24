@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -18,12 +20,15 @@ import (
 const minPayloadLen = 16
 
 type appConfig struct {
-	nodeAddr string
-	nodeID   string
-	chatID   string
-	role     string
-	payload  []byte
-	timeout  time.Duration
+	nodeAddr     string
+	nodeID       string
+	chatID       string
+	role         string
+	target       string
+	payload      []byte
+	timeout      time.Duration
+	identitySeed string
+	peerSeed     string
 }
 
 func main() {
@@ -37,10 +42,15 @@ func main() {
 func parseConfig() appConfig {
 	var cfg appConfig
 	var payload string
+	var identitySeed string
+	var peerSeed string
 	flag.StringVar(&cfg.nodeAddr, "node", "127.0.0.1:50051", "gRPC address for the node")
 	flag.StringVar(&cfg.nodeID, "node-id", "hermes-dev", "Node ID used in Connect signatures")
 	flag.StringVar(&cfg.chatID, "chat-id", "integration-chat", "Chat identifier to join")
 	flag.StringVar(&cfg.role, "role", "sender", "Role for this app (sender|receiver)")
+	flag.StringVar(&cfg.target, "target-app", "", "Target app identity to chat with")
+	flag.StringVar(&identitySeed, "identity-seed", "", "Optional seed for deterministic identity generation")
+	flag.StringVar(&peerSeed, "peer-seed", "", "Optional seed for peer identity when target-app is empty")
 	flag.StringVar(&payload, "payload", "integration-payload-012345", "Ciphertext payload to relay")
 	flag.DurationVar(&cfg.timeout, "timeout", 30*time.Second, "Overall timeout for the chat flow")
 	flag.Parse()
@@ -49,6 +59,19 @@ func parseConfig() appConfig {
 	case "sender", "receiver":
 	default:
 		log.Fatalf("unsupported role %s (expected sender or receiver)", cfg.role)
+	}
+
+	cfg.identitySeed = identitySeed
+	cfg.peerSeed = peerSeed
+
+	if cfg.target == "" {
+		if cfg.identitySeed == "" {
+			cfg.identitySeed = defaultSeed(cfg.role)
+		}
+		if cfg.peerSeed == "" {
+			cfg.peerSeed = defaultSeed(peerRole(cfg.role))
+		}
+		cfg.target = deriveAppIDFromSeed(cfg.peerSeed)
 	}
 
 	cfg.payload = []byte(payload)
@@ -74,9 +97,16 @@ func run(cfg appConfig) error {
 		return fmt.Errorf("open stream: %w", err)
 	}
 
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		return fmt.Errorf("generate identity: %w", err)
+	var pub ed25519.PublicKey
+	var priv ed25519.PrivateKey
+	if cfg.identitySeed != "" {
+		pub, priv = deriveKey(cfg.identitySeed)
+	} else {
+		var err error
+		pub, priv, err = ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			return fmt.Errorf("generate identity: %w", err)
+		}
 	}
 	if err := sendConnect(stream, cfg.nodeID, pub, priv); err != nil {
 		return err
@@ -89,7 +119,7 @@ func run(cfg appConfig) error {
 	if _, err := rand.Read(eph); err != nil {
 		return fmt.Errorf("ephemeral key: %w", err)
 	}
-	if err := sendStartChat(stream, cfg.chatID, eph, priv); err != nil {
+	if err := sendStartChat(stream, cfg.chatID, cfg.target, eph, priv); err != nil {
 		return err
 	}
 
@@ -195,12 +225,13 @@ func expectConnectAck(stream approuterpb.AppRouter_OpenClient) error {
 	return nil
 }
 
-func sendStartChat(stream approuterpb.AppRouter_OpenClient, chatID string, eph []byte, priv ed25519.PrivateKey) error {
+func sendStartChat(stream approuterpb.AppRouter_OpenClient, chatID, target string, eph []byte, priv ed25519.PrivateKey) error {
 	sig := ed25519.Sign(priv, eph)
 	return stream.Send(&approuterpb.AppFrame{
 		Body: &approuterpb.AppFrame_StartChat{
 			StartChat: &approuterpb.StartChat{
 				ChatId:                 chatID,
+				TargetAppId:            target,
 				PeerPublicEphemeralKey: eph,
 				Signature:              sig,
 			},
@@ -226,4 +257,29 @@ func sendDelete(stream approuterpb.AppRouter_OpenClient, chatID, reason string) 
 			DeleteChat: &approuterpb.DeleteChat{ChatId: chatID, Reason: reason},
 		},
 	})
+}
+
+func deriveKey(seed string) (ed25519.PublicKey, ed25519.PrivateKey) {
+	sum := sha256.Sum256([]byte(seed))
+	priv := ed25519.NewKeyFromSeed(sum[:])
+	return priv.Public().(ed25519.PublicKey), priv
+}
+
+func deriveAppIDFromSeed(seed string) string {
+	pub, _ := deriveKey(seed)
+	return hex.EncodeToString(pub)
+}
+
+func defaultSeed(role string) string {
+	if role == "receiver" {
+		return "mockapp-receiver"
+	}
+	return "mockapp-sender"
+}
+
+func peerRole(role string) string {
+	if role == "receiver" {
+		return "sender"
+	}
+	return "receiver"
 }

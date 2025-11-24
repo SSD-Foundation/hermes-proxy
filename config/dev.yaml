@@ -4,6 +4,21 @@ shutdown_grace_period: "10s"
 keystore:
   path: "data/keystore.json"
   passphrase_env: "HERMES_KEYSTORE_PASSPHRASE"
+mesh:
+  node_id: "hermes-dev"
+  public_address: "127.0.0.1:50051"
+  identity_secret: "mesh_identity"
+  wallet: ""
+  bootstrap_peers: []
+  tls:
+    enabled: false
+    cert_path: ""
+    key_path: ""
+    ca_path: ""
+    insecure_skip_verify: false
+  gossip:
+    dial_interval: "3s"
+    heartbeat_interval: "15s"
 admin:
   address: "0.0.0.0:8080"
   read_header_timeout: "5s"

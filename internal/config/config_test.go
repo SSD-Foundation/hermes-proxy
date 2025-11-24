@@ -28,6 +28,21 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Keystore.Path != defaultKeystorePath {
 		t.Fatalf("expected default keystore path %s, got %s", defaultKeystorePath, cfg.Keystore.Path)
 	}
+	if cfg.Mesh.NodeID != defaultMeshNodeID {
+		t.Fatalf("expected default mesh node id %s, got %s", defaultMeshNodeID, cfg.Mesh.NodeID)
+	}
+	if cfg.Mesh.PublicAddress != defaultMeshPublicAddress {
+		t.Fatalf("expected default mesh public address %s, got %s", defaultMeshPublicAddress, cfg.Mesh.PublicAddress)
+	}
+	if cfg.Mesh.IdentitySecret != defaultMeshIdentitySecret {
+		t.Fatalf("expected default mesh identity secret %s, got %s", defaultMeshIdentitySecret, cfg.Mesh.IdentitySecret)
+	}
+	if cfg.Mesh.Gossip.DialInterval != defaultMeshDialInterval {
+		t.Fatalf("expected default dial interval %s, got %s", defaultMeshDialInterval, cfg.Mesh.Gossip.DialInterval)
+	}
+	if cfg.Mesh.Gossip.HeartbeatInterval != defaultMeshHeartbeat {
+		t.Fatalf("expected default heartbeat %s, got %s", defaultMeshHeartbeat, cfg.Mesh.Gossip.HeartbeatInterval)
+	}
 }
 
 func TestLoadWithFileAndEnvOverride(t *testing.T) {
@@ -40,6 +55,16 @@ shutdown_grace_period: "5s"
 keystore:
   path: "/tmp/keystore.json"
   passphrase_env: "CUSTOM_ENV"
+mesh:
+  node_id: "node-b"
+  public_address: "node-b.example:1234"
+  identity_secret: "custom_secret"
+  bootstrap_peers:
+    - node_id: "node-a"
+      address: "node-a.example:1234"
+  gossip:
+    dial_interval: "1s"
+    heartbeat_interval: "2s"
 `), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -65,6 +90,24 @@ keystore:
 	}
 	if cfg.Keystore.PassphraseEnv != "CUSTOM_ENV" {
 		t.Fatalf("expected passphrase env CUSTOM_ENV, got %s", cfg.Keystore.PassphraseEnv)
+	}
+	if cfg.Mesh.NodeID != "node-b" {
+		t.Fatalf("expected mesh node id node-b, got %s", cfg.Mesh.NodeID)
+	}
+	if cfg.Mesh.PublicAddress != "node-b.example:1234" {
+		t.Fatalf("expected mesh public address override, got %s", cfg.Mesh.PublicAddress)
+	}
+	if cfg.Mesh.IdentitySecret != "custom_secret" {
+		t.Fatalf("expected mesh identity secret custom_secret, got %s", cfg.Mesh.IdentitySecret)
+	}
+	if len(cfg.Mesh.BootstrapPeers) != 1 || cfg.Mesh.BootstrapPeers[0].NodeID != "node-a" {
+		t.Fatalf("expected bootstrap peer node-a, got %+v", cfg.Mesh.BootstrapPeers)
+	}
+	if cfg.Mesh.Gossip.DialInterval != time.Second {
+		t.Fatalf("expected dial interval 1s, got %s", cfg.Mesh.Gossip.DialInterval)
+	}
+	if cfg.Mesh.Gossip.HeartbeatInterval != 2*time.Second {
+		t.Fatalf("expected heartbeat interval 2s, got %s", cfg.Mesh.Gossip.HeartbeatInterval)
 	}
 }
 

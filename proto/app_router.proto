@@ -29,6 +29,9 @@ message AppFrame {
 
     Error error = 10;
     Heartbeat heartbeat = 11;
+
+    FindApp find_app = 12;
+    FindAppResult find_app_result = 13;
   }
 }
 
@@ -51,6 +54,8 @@ message StartChat {
   bytes peer_public_ephemeral_key = 2;
   bytes signature = 3;
   map<string, string> metadata = 4;
+  string target_app_id = 5;
+  string target_node_hint = 6;
 }
 
 // StartChatAck acknowledges chat initialization.
@@ -86,6 +91,19 @@ message DeleteChatAck {
 // Heartbeat keeps the stream active and allows liveness tracking.
 message Heartbeat {
   int64 timestamp_nanos = 1;
+}
+
+// FindApp requests the hosting node for a target app identity.
+message FindApp {
+  string target_app_id = 1;
+  string target_node_hint = 2;
+}
+
+// FindAppResult returns routing information for a target app.
+message FindAppResult {
+  string target_app_id = 1;
+  string node_id = 2;
+  string status = 3;
 }
 
 // Error communicates terminal stream issues.
