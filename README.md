@@ -1,10 +1,10 @@
 # HERMES Nodes (Phase 2 – mesh bootstrap)
 
-This repository tracks the HERMES router nodes. Phase 1 delivers a gRPC-based service that connects Apps, manages encrypted 1:1 chats on a single node, and prepares the groundwork for the mesh, payments, and NAT features that follow. Phase 2 layers NodeMesh membership, peer discovery, and cross-node routing (implemented) on top of the existing chat plumbing. Platform target is Ubuntu Linux; the Phase 2 plan lives under `docs/plan/phase-2/`.
+This repository tracks the HERMES router nodes. Phase 1 delivers a gRPC-based service that connects Apps, manages encrypted 1:1 chats on a single node, and prepares the groundwork for the mesh, payments, and NAT features that follow. Phase 2 layers NodeMesh membership, peer discovery, and cross-node routing (implemented) on top of the existing chat plumbing. Phase 3 (per-chat PFS with signed X25519 exchange, HKDF-derived session keys, and ratcheting) is now planned in `docs/plan/phase-3/` while implementation is in progress. Platform target is Ubuntu Linux; the Phase 2 plan lives under `docs/plan/phase-2/`.
 
 ## Getting started
 - Read the MVP scope in `docs/hermes-mvp-revised.md`.
-- Review the Phase 1 plan and iteration prompts in `docs/plan/phase-1/` and the Phase 2 plan in `docs/plan/phase-2/`.
+- Review the Phase 1 plan and iteration prompts in `docs/plan/phase-1/`, the Phase 2 plan in `docs/plan/phase-2/`, and the Phase 3 PFS plan in `docs/plan/phase-3/`.
 - The gRPC contracts live in `proto/app_router.proto` and `proto/nodemesh.proto` with generated Go stubs in `pkg/api/approuterpb` and `pkg/api/nodemeshpb`.
 - The node binary entrypoint is `cmd/node` and hosts both `AppRouter.Open` (app connect/start chat/send/delete) and the new `NodeMesh` service for join/gossip/route envelopes.
 
@@ -96,6 +96,7 @@ grpc_server:
 - `docs/hermes-mvp-revised.md`: Revised MVP specification.
 - `docs/plan/phase-1/`: Implementation plan and iteration prompts for the delivered single-node scope.
 - `docs/plan/phase-2/`: Implementation plan and iteration prompts for the mesh/discovery scope.
+- `docs/plan/phase-3/`: Implementation plan and iteration prompts for per-chat PFS (key exchange, HKDF, ratcheting, erasure).
 - `docs/wiki/core-node-functionality.md`: Core behavior and operational notes (kept current as features land).
 - `AGENT.md`: Mandatory guardrails for testing, deployment, and docs maintenance.
 - `release-notes.md`: Latest user-visible changes.

@@ -1,6 +1,7 @@
 # Release Notes
 
 ## Unreleased
+- 2025-11-25: Added Phase 3 (per-chat PFS) plan with iteration prompts, refreshed AGENT guardrails/README/wiki for PFS scope and testing/deployment expectations.
 - 2025-11-24: Hardened integration harness: `make integration` now waits on mock app containers with `docker wait` and fails on missing/failed services; removed obsolete Compose version field to silence CI warnings.
 - 2025-11-24: Added churn/failover handling for NodeMesh: membership `FAIL` events and heartbeat evictions now remove peers, stop gossip/route streams, notify AppRouter to tear down remote chats (`route_unavailable`), and expose new mesh metrics for suspected/evicted peers with fresh unit tests.
 - 2025-11-24: Delivered cross-node chat routing: StartChat now carries a target app identity (plus FindApp helper), NodeMesh `RouteChat` relays setup/message/teardown with acks, outbound route client pool with TLS, SWIM-style gossip suspicion/eviction and app sync, mockapp flag for target routing, and new two-node component tests (happy path + unknown target/route loss). README/wiki/docs refreshed accordingly.
