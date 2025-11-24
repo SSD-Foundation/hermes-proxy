@@ -8,6 +8,8 @@ type Metrics struct {
 	joinFailure      prometheus.Counter
 	gossipHeartbeats prometheus.Counter
 	appSyncTotal     prometheus.Counter
+	suspectedPeers   prometheus.Gauge
+	evictedPeers     prometheus.Counter
 }
 
 func NewMetrics(reg prometheus.Registerer) *Metrics {
@@ -36,6 +38,14 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "hermes_mesh_appsync_total",
 			Help: "App presence sync frames processed.",
 		}),
+		suspectedPeers: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "hermes_mesh_suspected_peers",
+			Help: "Peers currently marked suspected by SWIM-like watchdog.",
+		}),
+		evictedPeers: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "hermes_mesh_evicted_peers_total",
+			Help: "Peers evicted after missed heartbeats.",
+		}),
 	}
 
 	reg.MustRegister(
@@ -44,6 +54,8 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.joinFailure,
 		m.gossipHeartbeats,
 		m.appSyncTotal,
+		m.suspectedPeers,
+		m.evictedPeers,
 	)
 	return m
 }
@@ -81,4 +93,18 @@ func (m *Metrics) RecordAppSync() {
 		return
 	}
 	m.appSyncTotal.Inc()
+}
+
+func (m *Metrics) SetSuspectedPeers(n int) {
+	if m == nil {
+		return
+	}
+	m.suspectedPeers.Set(float64(n))
+}
+
+func (m *Metrics) RecordEvictedPeer() {
+	if m == nil {
+		return
+	}
+	m.evictedPeers.Inc()
 }

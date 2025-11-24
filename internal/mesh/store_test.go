@@ -95,3 +95,38 @@ func TestStoreMergeMembersAndApps(t *testing.T) {
 		t.Fatalf("expected stale peer evicted, got %+v", removedMembers)
 	}
 }
+
+func TestStoreRemoveMember(t *testing.T) {
+	self := Member{
+		ID:          "self",
+		Endpoint:    "127.0.0.1:9000",
+		IdentityKey: bytes.Repeat([]byte{1}, ed25519.PublicKeySize),
+	}
+
+	store, err := NewStore(self)
+	if err != nil {
+		t.Fatalf("init store: %v", err)
+	}
+
+	peer := Member{
+		ID:          "peer-2",
+		Endpoint:    "10.0.0.4:50051",
+		IdentityKey: bytes.Repeat([]byte{4}, ed25519.PublicKeySize),
+		LastSeen:    time.Now(),
+	}
+	store.Upsert(peer, peer.LastSeen)
+	store.MergeApps([]registry.AppPresence{
+		{AppID: "remote-app", NodeID: peer.ID, SessionID: "s-remote"},
+	}, time.Now())
+
+	removed, ok := store.RemoveMember(peer.ID)
+	if !ok || removed.ID != peer.ID {
+		t.Fatalf("expected peer removed, got ok=%v removed=%+v", ok, removed)
+	}
+	if _, exists := store.Member(peer.ID); exists {
+		t.Fatalf("expected member to be gone")
+	}
+	if _, ok := store.ResolveApp("remote-app"); ok {
+		t.Fatalf("expected apps for peer to be evicted")
+	}
+}

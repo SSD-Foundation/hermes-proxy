@@ -21,22 +21,24 @@ import (
 // Service implements the NodeMesh gRPC contract.
 type Service struct {
 	nodemeshpb.UnimplementedNodeMeshServer
-	log     *zap.Logger
-	store   *Store
-	metrics *Metrics
-	apps    registry.AppRegistry
-	self    Identity
-	router  RouteHandler
+	log           *zap.Logger
+	store         *Store
+	metrics       *Metrics
+	apps          registry.AppRegistry
+	self          Identity
+	router        RouteHandler
+	onPeerRemoved func(Member)
 }
 
 // ServiceConfig wires dependencies for the NodeMesh service.
 type ServiceConfig struct {
-	Log      *zap.Logger
-	Store    *Store
-	Metrics  *Metrics
-	Apps     registry.AppRegistry
-	Identity Identity
-	Router   RouteHandler
+	Log           *zap.Logger
+	Store         *Store
+	Metrics       *Metrics
+	Apps          registry.AppRegistry
+	Identity      Identity
+	Router        RouteHandler
+	OnPeerRemoved func(Member)
 }
 
 // NewService constructs the NodeMesh service.
@@ -51,12 +53,13 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 		return nil, errors.New("mesh identity keys are required")
 	}
 	return &Service{
-		log:     cfg.Log,
-		store:   cfg.Store,
-		metrics: cfg.Metrics,
-		apps:    cfg.Apps,
-		self:    cfg.Identity,
-		router:  cfg.Router,
+		log:           cfg.Log,
+		store:         cfg.Store,
+		metrics:       cfg.Metrics,
+		apps:          cfg.Apps,
+		self:          cfg.Identity,
+		router:        cfg.Router,
+		onPeerRemoved: cfg.OnPeerRemoved,
 	}, nil
 }
 
@@ -136,7 +139,20 @@ func (s *Service) Gossip(stream nodemeshpb.NodeMesh_GossipServer) error {
 				continue
 			}
 			now := time.Now()
-			s.store.Upsert(memberFromProto(body.Membership.Node, now), now)
+			member := memberFromProto(body.Membership.Node, now)
+			switch body.Membership.Type {
+			case nodemeshpb.MembershipEvent_TYPE_FAIL, nodemeshpb.MembershipEvent_TYPE_LEAVE:
+				if removed, ok := s.store.RemoveMember(member.ID); ok {
+					s.metrics.RecordEvictedPeer()
+					s.metrics.SetKnownNodes(len(s.store.Snapshot()))
+					s.log.Warn("removed failed peer from membership", zap.String("node_id", removed.ID))
+					if s.onPeerRemoved != nil {
+						s.onPeerRemoved(removed)
+					}
+					continue
+				}
+			}
+			s.store.Upsert(member, now)
 			s.metrics.SetKnownNodes(len(s.store.Snapshot()))
 		case *nodemeshpb.GossipMessage_AppSync:
 			if body.AppSync == nil {

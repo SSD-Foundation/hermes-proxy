@@ -28,7 +28,7 @@ export HERMES_KEYSTORE_PASSPHRASE=change-me
 go run ./cmd/node --config config/dev.yaml
 ```
 
-If the keystore file does not exist, it is initialized automatically at the configured path. A small admin HTTP server (default `:8080`) serves `GET /healthz`, `GET /readyz`, Prometheus metrics at `GET /metrics`, and a membership dump at `GET /mesh/members` for mesh debugging.
+If the keystore file does not exist, it is initialized automatically at the configured path. A small admin HTTP server (default `:8080`) serves `GET /healthz`, `GET /readyz`, Prometheus metrics at `GET /metrics`, and a membership dump at `GET /mesh/members` for mesh debugging. Mesh metrics include node counts, join/app sync counters, and churn visibility (`hermes_mesh_suspected_peers`, `hermes_mesh_evicted_peers_total`).
 
 ## Configuration
 Configuration is read from a file plus environment overrides (`HERMES_` prefix). Example:
@@ -73,6 +73,7 @@ grpc_server:
 ## Mesh bootstrap
 - Node identity (ed25519) is stored in the sealed keystore under `mesh.identity_secret` and advertised during `NodeMesh.Join` alongside the node ID, wallet placeholder, and public endpoint.
 - Bootstrap peers are configured under `mesh.bootstrap_peers`; the dialer signs Join requests, validates peer signatures, merges membership snapshots, and opens a heartbeat `Gossip` stream with backoff plus SWIM-like suspicion/eviction. Periodic AppSync frames propagate app presence updates.
+- When a peer is declared failed (gossip `FAIL` event or heartbeat timeout), gossip/route streams to that node are closed, routing/app entries are purged, and AppRouter tears down chats involving that node with a `route_unavailable` status.
 - Connected apps are registered in an in-memory discovery map keyed by app identity; the routing table merges local registrations with mesh AppSync/state for discovery and target resolution.
 - Node-to-node `RouteChat` streams are pooled per peer (TLS optional) to relay `SetupTieline`/`RelayMessage`/`TeardownTieline` envelopes with ACKs and backpressure handling.
 - TLS between nodes is configurable under `mesh.tls` (disabled by default for dev/test); when enabled the gRPC server uses the provided cert/key and optional CA for peer auth and the dialer/route pool reuse the same materials for outbound streams.

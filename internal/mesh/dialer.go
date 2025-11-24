@@ -44,6 +44,8 @@ type DialerConfig struct {
 	SuspectAfter      time.Duration
 	EvictAfter        time.Duration
 	AppSyncInterval   time.Duration
+	OnPeerEvicted     func(Member)
+	OnPeerSuspect     func(Member)
 }
 
 // Dialer attempts to join bootstrap peers and maintain gossip streams.
@@ -60,6 +62,8 @@ type Dialer struct {
 	evictAfter        time.Duration
 	appSyncInterval   time.Duration
 	metrics           *Metrics
+	onPeerEvicted     func(Member)
+	onPeerSuspect     func(Member)
 
 	mu            sync.Mutex
 	gossipStarted map[string]bool
@@ -103,6 +107,8 @@ func NewDialer(cfg DialerConfig) (*Dialer, error) {
 		evictAfter:        cfg.EvictAfter,
 		appSyncInterval:   cfg.AppSyncInterval,
 		metrics:           cfg.Metrics,
+		onPeerEvicted:     cfg.OnPeerEvicted,
+		onPeerSuspect:     cfg.OnPeerSuspect,
 		gossipStarted:     make(map[string]bool),
 		gossipCh:          make(map[string]chan *nodemeshpb.GossipMessage),
 		suspected:         make(map[string]bool),
@@ -359,30 +365,49 @@ func (d *Dialer) watchdog(ctx context.Context) {
 			return
 		case <-ticker.C:
 			now := time.Now()
+			current := make(map[string]struct{})
 			for _, member := range d.store.Snapshot() {
 				if member.ID == d.identity.Member.ID {
 					continue
 				}
+				current[member.ID] = struct{}{}
 				elapsed := now.Sub(member.LastSeen)
 				if elapsed > d.suspectAfter {
 					if !d.suspected[member.ID] {
 						d.suspected[member.ID] = true
 						d.log.Warn("peer suspected", zap.String("node_id", member.ID), zap.Duration("last_seen_ago", elapsed))
+						if d.onPeerSuspect != nil {
+							d.onPeerSuspect(member)
+						}
 					}
 				} else {
 					delete(d.suspected, member.ID)
+				}
+			}
+			for id := range d.suspected {
+				if _, ok := current[id]; !ok {
+					delete(d.suspected, id)
+				}
+			}
+			for _, started := range d.startedPeers() {
+				if started == d.identity.Member.ID {
+					continue
+				}
+				if _, ok := current[started]; !ok {
+					d.stopGossip(started)
 				}
 			}
 
 			cutoff := now.Add(-d.evictAfter)
 			removed := d.store.EvictStale(cutoff)
 			if len(removed) == 0 {
+				d.metrics.SetSuspectedPeers(len(d.suspected))
 				continue
 			}
-			d.metrics.SetKnownNodes(len(d.store.Snapshot()))
 			for _, member := range removed {
 				delete(d.suspected, member.ID)
 				d.log.Warn("evicted stale peer", zap.String("node_id", member.ID))
+				d.stopGossip(member.ID)
 				d.broadcast(&nodemeshpb.GossipMessage{
 					Body: &nodemeshpb.GossipMessage_Membership{
 						Membership: &nodemeshpb.MembershipEvent{
@@ -391,7 +416,35 @@ func (d *Dialer) watchdog(ctx context.Context) {
 						},
 					},
 				})
+				if d.onPeerEvicted != nil {
+					d.onPeerEvicted(member)
+				}
+				d.metrics.RecordEvictedPeer()
 			}
+			d.metrics.SetKnownNodes(len(d.store.Snapshot()))
+			d.metrics.SetSuspectedPeers(len(d.suspected))
 		}
 	}
+}
+
+func (d *Dialer) stopGossip(nodeID string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if ch, ok := d.gossipCh[nodeID]; ok {
+		close(ch)
+		delete(d.gossipCh, nodeID)
+	}
+	d.gossipStarted[nodeID] = false
+}
+
+func (d *Dialer) startedPeers() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	out := make([]string, 0, len(d.gossipStarted))
+	for id := range d.gossipStarted {
+		out = append(out, id)
+	}
+	return out
 }

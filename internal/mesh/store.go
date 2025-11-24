@@ -229,6 +229,25 @@ func (s *Store) RemoveAppsForNode(nodeID string) int {
 	return removed
 }
 
+// RemoveMember deletes a member and evicts any apps hosted on that node.
+func (s *Store) RemoveMember(nodeID string) (Member, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	member, ok := s.members[nodeID]
+	if !ok || nodeID == s.self.ID {
+		return Member{}, false
+	}
+
+	delete(s.members, nodeID)
+	for appID, app := range s.apps {
+		if app.NodeID == nodeID {
+			delete(s.apps, appID)
+		}
+	}
+	return cloneMember(member), true
+}
+
 // EvictStale removes members that have not heartbeated since the cutoff time.
 func (s *Store) EvictStale(cutoff time.Time) []Member {
 	s.mu.Lock()

@@ -43,6 +43,7 @@ type NodeServer struct {
 	meshDialer  *mesh.Dialer
 	routes      *mesh.RouteClientPool
 	identity    mesh.Identity
+	router      *AppRouterService
 	ready       atomic.Bool
 }
 
@@ -107,6 +108,7 @@ func (s *NodeServer) Start(ctx context.Context) error {
 		Apps:                 s.apps,
 		MeshStore:            s.meshStore,
 	})
+	s.router = router
 
 	routePool, err := mesh.NewRouteClientPool(mesh.RouteClientConfig{
 		Log:         s.log,
@@ -179,11 +181,12 @@ func (s *NodeServer) initMesh(ctx context.Context) error {
 	s.meshMetrics.SetKnownNodes(len(store.Snapshot()))
 
 	svc, err := mesh.NewService(mesh.ServiceConfig{
-		Log:      s.log,
-		Store:    store,
-		Metrics:  s.meshMetrics,
-		Apps:     s.apps,
-		Identity: s.identity,
+		Log:           s.log,
+		Store:         store,
+		Metrics:       s.meshMetrics,
+		Apps:          s.apps,
+		Identity:      s.identity,
+		OnPeerRemoved: s.handlePeerEvicted,
 	})
 	if err != nil {
 		return fmt.Errorf("init mesh service: %w", err)
@@ -200,6 +203,7 @@ func (s *NodeServer) initMesh(ctx context.Context) error {
 		Interval:          s.cfg.Mesh.Gossip.DialInterval,
 		HeartbeatInterval: s.cfg.Mesh.Gossip.HeartbeatInterval,
 		Metrics:           s.meshMetrics,
+		OnPeerEvicted:     s.handlePeerEvicted,
 	})
 	if err != nil {
 		return fmt.Errorf("init mesh dialer: %w", err)
@@ -331,5 +335,18 @@ func (s *NodeServer) Shutdown(ctx context.Context) {
 	case <-ctx.Done():
 		s.log.Warn("graceful shutdown timed out; forcing stop")
 		s.grpcServer.Stop()
+	}
+}
+
+func (s *NodeServer) handlePeerEvicted(member mesh.Member) {
+	if member.ID == "" {
+		return
+	}
+	s.log.Warn("peer evicted, cleaning up routes", zap.String("node_id", member.ID))
+	if s.routes != nil {
+		s.routes.Close(member.ID)
+	}
+	if s.router != nil {
+		s.router.handleNodeLoss(member.ID, "route_unavailable")
 	}
 }
